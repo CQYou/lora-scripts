@@ -1,6 +1,8 @@
 
 import asyncio
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -29,6 +31,8 @@ DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
 MESH_NET_MONITOR_INTERVAL_SECONDS = 10
+CKPT_EXTENSIONS = {".safetensors", ".ckpt", ".pt"}
+TB_EVENT_FILE_GLOB = "events.out.tfevents.*"
 
 
 def _to_bool(value, default=False):
@@ -454,6 +458,229 @@ def _resolve_remote_path(path_value: str, remote_repo_root: str) -> str:
     if os.path.isabs(path_value):
         return path_value
     return str(Path(remote_repo_root) / path_value)
+
+
+def _is_tensorboard_logging_enabled(config: dict) -> bool:
+    logging_dir = str(config.get("logging_dir", "") or "").strip()
+    if not logging_dir:
+        return False
+
+    log_with = config.get("log_with")
+    if log_with is None:
+        return True
+    return str(log_with).strip().lower() in {"tensorboard", "all"}
+
+
+def _sanitize_tensorboard_component(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", str(value or "").strip())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_.")
+    return cleaned or "model"
+
+
+def _resolve_tensorboard_model_name(config: dict) -> str:
+    for key in ("output_name", "log_prefix"):
+        value = str(config.get(key, "") or "").strip()
+        if value:
+            return _sanitize_tensorboard_component(value)
+    return "model"
+
+
+def _read_resume_tensorboard_dir_from_state(config: dict, repo_root: Path) -> Optional[Path]:
+    resume_path = str(config.get("resume", "") or "").strip()
+    if not resume_path:
+        return None
+
+    local_resume_dir = _resolve_local_path(resume_path, repo_root)
+    if not local_resume_dir.exists() or not local_resume_dir.is_dir():
+        return None
+
+    train_state_file = local_resume_dir / "train_state.json"
+    if not train_state_file.exists():
+        return None
+
+    try:
+        with open(train_state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        log.warning(f"[tensorboard] failed to read state file: {train_state_file}")
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    logging_dir = data.get("logging_dir")
+    if not isinstance(logging_dir, str) or not logging_dir.strip():
+        return None
+
+    logging_dir_path = Path(logging_dir.strip()).expanduser()
+    if not logging_dir_path.is_absolute():
+        logging_dir_path = (repo_root / logging_dir_path).resolve()
+    return logging_dir_path
+
+
+def _find_latest_tensorboard_run(logging_root: Path, model_name: str) -> Optional[Path]:
+    if not logging_root.exists() or not logging_root.is_dir():
+        return None
+
+    pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(model_name)}_(\d+)$")
+    candidates = []
+    for entry in logging_root.iterdir():
+        if not entry.is_dir():
+            continue
+        match = pattern.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            stat = entry.stat()
+            candidates.append((stat.st_mtime, int(match.group(1)), entry))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _build_next_tensorboard_run(logging_root: Path, model_name: str) -> Path:
+    logging_root.mkdir(parents=True, exist_ok=True)
+
+    date_prefix = datetime.now().strftime("%Y-%m-%d")
+    run_prefix = f"{date_prefix}_{model_name}_"
+    pattern = re.compile(rf"^{re.escape(run_prefix)}(\d+)$")
+    max_index = 0
+
+    for entry in logging_root.iterdir():
+        if not entry.is_dir():
+            continue
+        match = pattern.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            max_index = max(max_index, int(match.group(1)))
+        except Exception:
+            continue
+
+    return logging_root / f"{run_prefix}{max_index + 1}"
+
+
+def _resolve_tensorboard_run_dir_from_config(config: dict, repo_root: Path) -> Optional[Path]:
+    if not _is_tensorboard_logging_enabled(config):
+        return None
+
+    logging_root = _resolve_local_path(str(config.get("logging_dir", "./logs") or "./logs"), repo_root)
+    model_name = _resolve_tensorboard_model_name(config)
+
+    resume_logging_dir = _read_resume_tensorboard_dir_from_state(config, repo_root)
+    if resume_logging_dir is not None:
+        return resume_logging_dir
+
+    resume_path = str(config.get("resume", "") or "").strip()
+    if resume_path:
+        latest_run = _find_latest_tensorboard_run(logging_root, model_name)
+        if latest_run is not None:
+            return latest_run
+
+    return _build_next_tensorboard_run(logging_root, model_name)
+
+
+def _snapshot_tensorboard_event_files(run_dir: Optional[Path]) -> dict:
+    snapshot = {}
+    if run_dir is None or not run_dir.exists():
+        return snapshot
+
+    for event_file in run_dir.rglob(TB_EVENT_FILE_GLOB):
+        if not event_file.is_file():
+            continue
+        try:
+            stat = event_file.stat()
+        except Exception:
+            continue
+        snapshot[str(event_file.resolve())] = (stat.st_size, stat.st_mtime)
+    return snapshot
+
+
+def _list_checkpoint_files_for_run(config: dict, repo_root: Path) -> list[Path]:
+    output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
+    if not output_dir.exists() or not output_dir.is_dir():
+        return []
+
+    output_name = str(config.get("output_name", "") or "").strip()
+    files = {}
+    for ext in CKPT_EXTENSIONS:
+        pattern = f"{output_name}*{ext}" if output_name else f"*{ext}"
+        for ckpt_file in output_dir.glob(pattern):
+            if ckpt_file.is_file():
+                files[str(ckpt_file.resolve())] = ckpt_file
+    return list(files.values())
+
+
+def _has_new_checkpoint_since(config: dict, repo_root: Path, started_at: float) -> bool:
+    output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
+    output_name = str(config.get("output_name", "") or "").strip()
+
+    for ckpt_file in _list_checkpoint_files_for_run(config, repo_root):
+        try:
+            if ckpt_file.stat().st_mtime >= started_at:
+                return True
+        except Exception:
+            continue
+
+    if output_dir.exists() and output_dir.is_dir():
+        for child in output_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if output_name and not child.name.startswith(output_name):
+                continue
+            if child.name.endswith("-state"):
+                continue
+            marker_file = child / "model_index.json"
+            if not marker_file.is_file():
+                continue
+            try:
+                if max(child.stat().st_mtime, marker_file.stat().st_mtime) >= started_at:
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
+def _cleanup_tensorboard_records_without_checkpoint(run_dir: Optional[Path], existed_before: bool, event_snapshot: dict):
+    if run_dir is None or not run_dir.exists():
+        return
+
+    if not existed_before:
+        try:
+            shutil.rmtree(run_dir)
+            log.info(f"[tensorboard] removed run dir because no checkpoint was produced: {run_dir}")
+        except Exception as e:
+            log.warning(f"[tensorboard] failed to remove run dir without checkpoint: {run_dir} ({e})")
+        return
+
+    existing_keys = set(event_snapshot.keys())
+    removed_files = 0
+    for event_file in run_dir.rglob(TB_EVENT_FILE_GLOB):
+        if not event_file.is_file():
+            continue
+        resolved = str(event_file.resolve())
+        if resolved in existing_keys:
+            continue
+        try:
+            event_file.unlink()
+            removed_files += 1
+        except Exception as e:
+            log.warning(f"[tensorboard] failed to remove event file without checkpoint: {event_file} ({e})")
+
+    for dir_path in sorted([p for p in run_dir.rglob("*") if p.is_dir()], reverse=True):
+        try:
+            dir_path.rmdir()
+        except OSError:
+            continue
+
+    if removed_files > 0:
+        log.info(f"[tensorboard] removed {removed_files} new event file(s) because no checkpoint was produced")
 
 
 def _run_cmd(cmd: list, desc: str):
@@ -1038,6 +1265,22 @@ def run_train(toml_path: str,
     else:
         log.info("[output-policy] skipped (single-machine or main node)")
 
+    repo_root = base_dir_path()
+    runtime_train_config = {}
+    try:
+        runtime_train_config = toml.load(toml_path)
+    except Exception as e:
+        log.warning(f"[runtime-config] failed to parse training config before launch: {toml_path} ({e})")
+
+    tensorboard_run_dir = _resolve_tensorboard_run_dir_from_config(runtime_train_config, repo_root) if runtime_train_config else None
+    tensorboard_run_dir_existed_before = bool(tensorboard_run_dir and tensorboard_run_dir.exists())
+    tensorboard_event_snapshot = _snapshot_tensorboard_event_files(tensorboard_run_dir)
+    if tensorboard_run_dir is not None:
+        log.info(
+            f"[tensorboard] resolved run dir: {tensorboard_run_dir} "
+            f"(resume_merge={'yes' if tensorboard_run_dir_existed_before else 'no'})"
+        )
+
     if gpu_ids:
         customize_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
         log.info(f"Using GPU(s) / 使用 GPU: {gpu_ids}")
@@ -1081,6 +1324,7 @@ def run_train(toml_path: str,
         mesh_stop_event = None
         mesh_thread = None
         try:
+            run_started_at = time.time()
             task.execute()
             if num_machines > 1 and mesh_iface:
                 mesh_stop_event = threading.Event()
@@ -1097,6 +1341,17 @@ def run_train(toml_path: str,
                 )
                 mesh_thread.start()
             result = task.communicate()
+
+            checkpoint_generated = _has_new_checkpoint_since(runtime_train_config, repo_root, run_started_at) if runtime_train_config else False
+            if tensorboard_run_dir is not None and not checkpoint_generated:
+                _cleanup_tensorboard_records_without_checkpoint(
+                    tensorboard_run_dir,
+                    tensorboard_run_dir_existed_before,
+                    tensorboard_event_snapshot,
+                )
+            elif tensorboard_run_dir is not None:
+                log.info(f"[tensorboard] checkpoint detected, keep run dir: {tensorboard_run_dir}")
+
             if result.returncode != 0:
                 log.error(f"Training failed / 训练失败")
             else:

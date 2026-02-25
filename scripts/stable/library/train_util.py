@@ -4766,6 +4766,99 @@ def load_tokenizer(args: argparse.Namespace):
     return tokenizer
 
 
+def _sanitize_tensorboard_component(value: Optional[str]) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", str(value or "").strip())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_.")
+    return cleaned or "model"
+
+
+def _resolve_tensorboard_model_name(args: argparse.Namespace) -> str:
+    # Prefer explicit output model name, then user-provided log_prefix.
+    for candidate in (getattr(args, "output_name", None), getattr(args, "log_prefix", None)):
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if text:
+            return _sanitize_tensorboard_component(text)
+    return "model"
+
+
+def _read_resume_tensorboard_dir(args: argparse.Namespace) -> Optional[str]:
+    resume_dir = getattr(args, "resume", None)
+    if not resume_dir or not os.path.isdir(resume_dir):
+        return None
+
+    train_state_file = os.path.join(resume_dir, "train_state.json")
+    if not os.path.isfile(train_state_file):
+        return None
+
+    try:
+        with open(train_state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        logger.warning(f"failed to read train_state.json while resolving tensorboard dir: {train_state_file}", exc_info=True)
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    logging_dir = data.get("logging_dir")
+    if not isinstance(logging_dir, str) or not logging_dir.strip():
+        return None
+
+    logging_dir = logging_dir.strip()
+    if not os.path.isabs(logging_dir):
+        logging_dir = os.path.abspath(logging_dir)
+    return logging_dir
+
+
+def _find_latest_tensorboard_run(logging_root: str, model_name: str) -> Optional[str]:
+    if not os.path.isdir(logging_root):
+        return None
+
+    pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(model_name)}_(\d+)$")
+    candidates: List[Tuple[float, int, str]] = []
+    for entry in os.scandir(logging_root):
+        if not entry.is_dir():
+            continue
+        match = pattern.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            stat = entry.stat()
+            candidates.append((stat.st_mtime, int(match.group(1)), entry.path))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return os.path.abspath(candidates[0][2])
+
+
+def _build_next_tensorboard_run(logging_root: str, model_name: str) -> str:
+    os.makedirs(logging_root, exist_ok=True)
+
+    date_prefix = time.strftime("%Y-%m-%d", time.localtime())
+    run_prefix = f"{date_prefix}_{model_name}_"
+    pattern = re.compile(rf"^{re.escape(run_prefix)}(\d+)$")
+    max_index = 0
+
+    for entry in os.scandir(logging_root):
+        if not entry.is_dir():
+            continue
+        match = pattern.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            max_index = max(max_index, int(match.group(1)))
+        except Exception:
+            continue
+
+    return os.path.abspath(os.path.join(logging_root, f"{run_prefix}{max_index + 1}"))
+
+
 def prepare_accelerator(args: argparse.Namespace):
     """
     this function also prepares deepspeed plugin
@@ -4774,8 +4867,27 @@ def prepare_accelerator(args: argparse.Namespace):
     if args.logging_dir is None:
         logging_dir = None
     else:
-        log_prefix = "" if args.log_prefix is None else args.log_prefix
-        logging_dir = args.logging_dir + "/" + log_prefix + time.strftime("%Y%m%d%H%M%S", time.localtime())
+        logging_root = os.path.abspath(args.logging_dir)
+        model_name = _resolve_tensorboard_model_name(args)
+        if getattr(args, "resume", None):
+            resume_logging_dir = _read_resume_tensorboard_dir(args)
+            if resume_logging_dir:
+                logging_dir = resume_logging_dir
+                logger.info(f"resume detected, reusing tensorboard dir from state: {logging_dir}")
+            else:
+                fallback_logging_dir = _find_latest_tensorboard_run(logging_root, model_name)
+                if fallback_logging_dir:
+                    logging_dir = fallback_logging_dir
+                    logger.info(f"resume detected, fallback to latest tensorboard dir: {logging_dir}")
+                else:
+                    logging_dir = _build_next_tensorboard_run(logging_root, model_name)
+                    logger.warning(
+                        f"resume detected but no previous tensorboard dir found, creating new run dir: {logging_dir}"
+                    )
+        else:
+            logging_dir = _build_next_tensorboard_run(logging_root, model_name)
+        setattr(args, "resolved_logging_dir", logging_dir)
+        os.environ["MIKAZUKI_EFFECTIVE_TENSORBOARD_DIR"] = logging_dir
 
     if args.log_with is None:
         if logging_dir is not None:
