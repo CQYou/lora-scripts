@@ -1235,6 +1235,7 @@ class NetworkTrainer:
             assert (
                 args.max_train_steps > initial_step
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
+        resume_start_step = initial_step
 
         epoch_to_start = 0
         if initial_step > 0:
@@ -1254,7 +1255,7 @@ class NetworkTrainer:
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
 
-        global_step = 0
+        global_step = resume_start_step
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1321,7 +1322,7 @@ class NetworkTrainer:
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
-            global_step = initial_step
+            global_step = resume_start_step
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1335,7 +1336,11 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
+            total=args.max_train_steps,
+            initial=min(global_step, args.max_train_steps),
+            smoothing=0.5,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         validation_steps = (

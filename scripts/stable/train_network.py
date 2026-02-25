@@ -808,10 +808,7 @@ class NetworkTrainer:
             assert (
                 args.max_train_steps > initial_step
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
-
-        progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
-        )
+        resume_start_step = initial_step
 
         epoch_to_start = 0
         if initial_step > 0:
@@ -831,7 +828,14 @@ class NetworkTrainer:
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
 
-        global_step = 0
+        global_step = resume_start_step
+        progress_bar = tqdm(
+            total=args.max_train_steps,
+            initial=min(global_step, args.max_train_steps),
+            smoothing=0.5,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
 
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
@@ -893,7 +897,7 @@ class NetworkTrainer:
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
-            global_step = initial_step
+            global_step = resume_start_step
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")

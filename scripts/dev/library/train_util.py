@@ -4811,6 +4811,18 @@ def _move_value_to_device(value, device):
     return value
 
 
+def _count_tensor_devices(value, counter):
+    if isinstance(value, dict):
+        for v in value.values():
+            _count_tensor_devices(v, counter)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _count_tensor_devices(v, counter)
+    elif isinstance(value, torch.Tensor):
+        device_name = str(value.device)
+        counter[device_name] = counter.get(device_name, 0) + 1
+
+
 def _move_optimizer_states_to_accelerator_device(accelerator):
     device = getattr(accelerator, "device", None)
     if device is None:
@@ -4824,10 +4836,42 @@ def _move_optimizer_states_to_accelerator_device(accelerator):
         except Exception:
             logger.warning("failed to move optimizer states to accelerator device after resume", exc_info=True)
 
+    device_counts = {}
+    for optimizer in getattr(accelerator, "_optimizers", []):
+        try:
+            _count_tensor_devices(optimizer.state_dict(), device_counts)
+        except Exception:
+            logger.warning("failed to inspect optimizer state devices after resume", exc_info=True)
+    if device_counts:
+        summary = ", ".join([f"{dev}: {count}" for dev, count in sorted(device_counts.items())])
+        logger.info(f"optimizer state tensor devices after resume: {summary}")
+
+
+def _load_rng_state_compat_for_torch210(accelerator, state_dir: str):
+    import accelerate.checkpointing as accelerate_checkpointing
+
+    original_torch_load = accelerate_checkpointing.torch.load
+    process_index = accelerator.state.process_index
+    rng_state_file_name = f"{accelerate_checkpointing.RNG_STATE_NAME}_{process_index}.pkl"
+
+    def _patched_torch_load(*args, **kwargs):
+        source = args[0] if args else kwargs.get("f")
+        source_path = os.fspath(source) if hasattr(source, "__fspath__") else str(source)
+        if source_path.endswith(rng_state_file_name):
+            kwargs = dict(kwargs)
+            kwargs["weights_only"] = False
+        return original_torch_load(*args, **kwargs)
+
+    accelerate_checkpointing.torch.load = _patched_torch_load
+    try:
+        accelerator.load_state(state_dir)
+    finally:
+        accelerate_checkpointing.torch.load = original_torch_load
+
 
 def _load_state_with_step_fallback(accelerator, state_dir: str):
     try:
-        accelerator.load_state(state_dir)
+        _load_rng_state_compat_for_torch210(accelerator, state_dir)
         _move_optimizer_states_to_accelerator_device(accelerator)
         return
     except KeyError as e:
@@ -4911,6 +4955,25 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
         )
     dirname = os.path.dirname(results[0])
     _load_state_with_step_fallback(accelerator, dirname)
+
+
+def verify_state_dir_for_resume(state_dir: str, accelerator):
+    process_index = accelerator.state.process_index
+    rng_state_file = os.path.join(state_dir, f"random_states_{process_index}.pkl")
+    if not os.path.isfile(rng_state_file):
+        logger.warning(f"resume state check failed: missing RNG state file: {rng_state_file}")
+        return
+
+    try:
+        rng_state = torch.load(rng_state_file, map_location="cpu", weights_only=False)
+    except TypeError:
+        rng_state = torch.load(rng_state_file, map_location="cpu")
+    except Exception:
+        logger.warning(f"resume state check failed: cannot load RNG state file: {rng_state_file}", exc_info=True)
+        return
+
+    if not isinstance(rng_state, dict) or "step" not in rng_state:
+        logger.warning(f"resume state check failed: RNG state file has no step field: {rng_state_file}")
 
 
 def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
@@ -6051,6 +6114,7 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator, ep
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
+    verify_state_dir_for_resume(state_dir, accelerator)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_util.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -6073,6 +6137,7 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_n
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
+    verify_state_dir_for_resume(state_dir, accelerator)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_util.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -6099,6 +6164,7 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator):
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
+    verify_state_dir_for_resume(state_dir, accelerator)
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")
