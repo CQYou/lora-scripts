@@ -568,7 +568,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return { ok: true, ratios: ratios, total: total };
   }
 
-  function buildPhasePreview(baseBatch, baseEpochs, saveEveryEpochs, baseSampleEveryEpochs, previewEnabled, phaseRatioPercents) {
+  function buildPhasePreview(baseBatch, baseGradAccum, baseEpochs, saveEveryEpochs, baseSampleEveryEpochs, previewEnabled, phaseRatioPercents) {
     var rows = [];
     var totalEpochs = 0;
     for (var i = 0; i < PHASES.length; i++) {
@@ -580,7 +580,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (ratioPercent > 100) ratioPercent = 100;
       var ratio = ratioPercent / 100.0;
       var phaseBatch = Math.max(1, Math.floor(baseBatch * (1024 * 1024) / (side * side)));
-      var rawEpochs = Math.ceil(baseEpochs * ratio * (phaseBatch / baseBatch));
+      var phaseGradAccum = baseGradAccum <= 1 ? 1 : baseGradAccum;
+      var effectiveBatchRatio = (phaseBatch * phaseGradAccum) / (baseBatch * baseGradAccum);
+      var rawEpochs = Math.ceil(baseEpochs * ratio * effectiveBatchRatio);
       var phaseSaveEveryEpochs = Math.max(1, Math.ceil(saveEveryEpochs * phase.sampleScale));
       var phaseSampleEveryEpochs = Math.max(1, Math.ceil(baseSampleEveryEpochs * phase.sampleScale));
       var epochRoundBase = phaseSaveEveryEpochs;
@@ -596,13 +598,15 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
         side: side,
         ratioPercent: ratioPercent,
         batch: phaseBatch,
+        gradAccum: phaseGradAccum,
+        effectiveBatchRatio: effectiveBatchRatio,
         saveEveryEpochs: phaseSaveEveryEpochs,
         sampleEveryEpochs: phaseSampleEveryEpochs,
         sampleScale: phase.sampleScale,
         rawEpochs: rawEpochs,
         epochs: phaseEpochs,
         epochRoundBase: epochRoundBase,
-        rawFormula: "ceil(" + baseEpochs + " * (" + ratioPercent + " / 100) * (" + phaseBatch + " / " + baseBatch + "))",
+        rawFormula: "ceil(" + baseEpochs + " * (" + ratioPercent + " / 100) * ((" + phaseBatch + "*" + phaseGradAccum + ") / (" + baseBatch + "*" + baseGradAccum + ")))",
         actualFormula: ratioPercent > 0
           ? (previewEnabled
               ? "ceil_to_multiple(raw, lcm(save=" + phaseSaveEveryEpochs + ", sample=" + phaseSampleEveryEpochs + ")=" + epochRoundBase + ")"
@@ -614,6 +618,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       rows: rows,
       totalEpochs: totalEpochs,
       previewEnabled: !!previewEnabled,
+      baseGradAccum: baseGradAccum,
       saveEveryEpochs: saveEveryEpochs,
       baseSampleEveryEpochs: baseSampleEveryEpochs,
       ratioSumPercent: rows.reduce(function (acc, row) { return acc + row.ratioPercent; }, 0)
@@ -624,13 +629,14 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var html = "";
     html += '<div class="stage-title">阶段分辨率预览（启用后将按以下计划训练）</div>';
     html += "<table>";
-    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>实际 Epoch</th><th>取整基数</th></tr></thead><tbody>";
+    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch</th><th>梯度累加步数</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>实际 Epoch</th><th>取整基数</th></tr></thead><tbody>";
     for (var i = 0; i < preview.rows.length; i++) {
       var row = preview.rows[i];
       html += "<tr>";
       html += "<td>" + row.side + "x" + row.side + "</td>";
       html += "<td>" + row.ratioPercent + "</td>";
       html += "<td>" + row.batch + "</td>";
+      html += "<td>" + row.gradAccum + "（与1024基准一致）</td>";
       html += "<td>" + row.saveEveryEpochs + " (x" + row.sampleScale + ")</td>";
       html += "<td>" + row.sampleEveryEpochs + " (x" + row.sampleScale + ")</td>";
       html += "<td>" + row.rawEpochs + "</td>";
@@ -640,7 +646,8 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     }
     html += "</tbody></table>";
     html += '<div class="stage-note">总 Epoch（阶段累计）: ' + preview.totalEpochs + "；占比总和: " + preview.ratioSumPercent + "%（要求 ≤ 100%）</div>";
-    html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * (phase_batch / base_batch))</div>';
+    html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * ((phase_batch*phase_grad_accum) / (base_batch*base_grad_accum)))</div>';
+    html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 1024 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
     if (preview.previewEnabled) {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, lcm(phase_save_every_n_epochs, phase_sample_every_n_epochs))</div>';
     } else {
@@ -763,6 +770,10 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       /最大训练\\s*epoch/,
       /最大训练轮/
     ]);
+    var gradAccumField = findSchemaField([
+      /gradient_accumulation_steps/i,
+      /梯度累加/
+    ]);
     var saveEveryField = findSchemaField([
       /save_every_n_epochs/i,
       /每\\s*n\\s*epoch/,
@@ -778,10 +789,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     ]);
 
     var baseBatch = batchField ? readInt(batchField.item, 0) : 0;
+    var baseGradAccum = gradAccumField ? readInt(gradAccumField.item, 1) : 1;
     var baseEpochs = epochsField ? readInt(epochsField.item, 0) : 0;
     var saveEveryEpochs = saveEveryField ? readInt(saveEveryField.item, 1) : 1;
     var previewEnabled = previewEnableField ? readBool(previewEnableField.item) : false;
     var baseSampleEveryEpochs = sampleEveryField ? readInt(sampleEveryField.item, 1) : 1;
+    if (baseGradAccum <= 0) baseGradAccum = 1;
     if (saveEveryEpochs <= 0) saveEveryEpochs = 1;
     if (baseSampleEveryEpochs <= 0) baseSampleEveryEpochs = 1;
 
@@ -804,6 +817,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 
     var preview = buildPhasePreview(
       baseBatch,
+      baseGradAccum,
       baseEpochs,
       saveEveryEpochs,
       baseSampleEveryEpochs,
@@ -814,12 +828,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (previewEnabled) {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；ckpt 与 sample 频率均按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并纳入实际 epoch 取整。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；梯度累加保持与 1024 基准一致，ckpt 与 sample 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并纳入实际 epoch 取整。"
         );
       } else {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；ckpt 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并已实时预估三阶段 batch 与 epoch（未启用训练预览图时不纳入 sample 频率取整）。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；梯度累加保持与 1024 基准一致，ckpt 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并已实时预估三阶段 batch 与 epoch（未启用训练预览图时不纳入 sample 频率取整）。"
         );
       }
     }

@@ -376,9 +376,11 @@ def _run_mixed_plan(plan: dict) -> int:
             f"[staged-resolution] phase {phase_index}/{len(phases)} start: "
             f"res={phase.get('resolution')} ratio_percent={phase.get('ratio_percent')} "
             f"batch={phase.get('batch_size')} "
+            f"grad_accum={phase.get('gradient_accumulation_steps')} "
             f"save_every_n_epochs={phase.get('save_every_n_epochs')} "
             f"sample_every_n_epochs={phase.get('sample_every_n_epochs')} "
             f"epochs={phase.get('epochs')} "
+            f"batches_per_epoch={phase.get('batches_per_epoch')} "
             f"phase_steps={phase.get('phase_steps')} target_max_steps={phase.get('target_max_train_steps')} "
             f"target_epoch_end={phase.get('target_epoch_end')}"
         )

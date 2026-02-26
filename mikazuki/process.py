@@ -268,6 +268,13 @@ def _build_mixed_resolution_plan(
         return None, "启用阶段分辨率训练时，train_batch_size 必须大于 0"
 
     try:
+        base_gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1) or 1)
+    except Exception:
+        base_gradient_accumulation_steps = 1
+    if base_gradient_accumulation_steps <= 0:
+        base_gradient_accumulation_steps = 1
+
+    try:
         save_every_n_epochs = int(config.get("save_every_n_epochs", save_every_n_epochs_default) or save_every_n_epochs_default)
     except Exception:
         save_every_n_epochs = save_every_n_epochs_default
@@ -299,6 +306,7 @@ def _build_mixed_resolution_plan(
         "base_resolution": [base_side, base_side],
         "base_epochs": int(base_epochs),
         "base_batch": int(base_batch),
+        "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
         "save_every_n_epochs": int(save_every_n_epochs),
         "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
         "base_sample_every_n_epochs": int(base_sample_every_n_epochs) if base_sample_every_n_epochs is not None else None,
@@ -331,6 +339,15 @@ def _build_mixed_resolution_plan(
         batch_this_phase = max(1, int(math.floor(base_batch * (base_pixels / target_pixels))))
 
         sample_factor = float(MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS.get(side, base_pixels / target_pixels))
+        # Keep gradient-accumulation semantics anchored to 1024 baseline:
+        # - base grad_accum <= 1: keep 1
+        # - base grad_accum > 1: keep the same x across all phases
+        gradient_accumulation_steps_this_phase = (
+            1 if base_gradient_accumulation_steps <= 1 else int(base_gradient_accumulation_steps)
+        )
+        gradient_accumulation_factor = (
+            float(gradient_accumulation_steps_this_phase) / float(max(1, base_gradient_accumulation_steps))
+        )
         save_every_n_epochs_this_phase = _scale_epoch_interval(save_every_n_epochs, sample_factor)
         sample_every_n_epochs_this_phase = (
             _scale_epoch_interval(base_sample_every_n_epochs, sample_factor) if use_sample_epoch_schedule else None
@@ -339,11 +356,16 @@ def _build_mixed_resolution_plan(
         if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             epoch_rounding_multiple = _lcm(epoch_rounding_multiple, sample_every_n_epochs_this_phase)
 
-        # Raw formula: ceil(base_epochs * phase_ratio * (phase_batch / base_batch))
-        raw_epochs_this_phase = int(math.ceil(base_epochs * ratio * (batch_this_phase / base_batch)))
+        effective_batch_ratio = (
+            (batch_this_phase * gradient_accumulation_steps_this_phase)
+            / (base_batch * base_gradient_accumulation_steps)
+        )
+        # Raw formula: ceil(base_epochs * phase_ratio * (phase_effective_batch / base_effective_batch))
+        raw_epochs_this_phase = int(math.ceil(base_epochs * ratio * effective_batch_ratio))
         # Actual formula: ceil_to_multiple(raw_epochs, lcm(save_every_n_epochs, sample_every_n_epochs_phase))
         epochs_this_phase = _ceil_to_multiple(max(1, raw_epochs_this_phase), epoch_rounding_multiple)
-        steps_per_epoch = max(1, int(math.ceil(total_train_images / batch_this_phase)))
+        batches_per_epoch = max(1, int(math.ceil(total_train_images / batch_this_phase)))
+        steps_per_epoch = max(1, int(math.ceil(batches_per_epoch / gradient_accumulation_steps_this_phase)))
         steps_this_phase = int(epochs_this_phase * steps_per_epoch)
 
         cumulative_epochs += int(epochs_this_phase)
@@ -354,6 +376,7 @@ def _build_mixed_resolution_plan(
         phase_config[MIXED_RESOLUTION_ENABLE_KEY] = False
         phase_config["resolution"] = f"{side},{side}"
         phase_config["train_batch_size"] = int(batch_this_phase)
+        phase_config["gradient_accumulation_steps"] = int(gradient_accumulation_steps_this_phase)
         phase_config["max_train_steps"] = int(cumulative_steps)
         phase_config.pop("max_train_epochs", None)
         phase_config.pop("resume_epoch_offset", None)
@@ -373,7 +396,9 @@ def _build_mixed_resolution_plan(
             toml.dump(phase_config, f)
 
         raw_formula = (
-            f"ceil({base_epochs} * ({ratio_percent:g} / 100) * ({batch_this_phase} / {base_batch}))"
+            f"ceil({base_epochs} * ({ratio_percent:g} / 100) * "
+            f"(({batch_this_phase}*{gradient_accumulation_steps_this_phase}) / "
+            f"({base_batch}*{base_gradient_accumulation_steps})))"
         )
         if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             actual_formula = (
@@ -396,15 +421,19 @@ def _build_mixed_resolution_plan(
                 "resolution": f"{side},{side}",
                 "ratio": float(ratio),
                 "ratio_percent": float(ratio_percent),
+                "effective_batch_ratio": float(effective_batch_ratio),
                 "raw_epochs": int(raw_epochs_this_phase),
                 "epochs": int(epochs_this_phase),
                 "raw_epochs_formula": raw_formula,
                 "actual_epochs_formula": actual_formula,
+                "batches_per_epoch": int(batches_per_epoch),
                 "steps_per_epoch": int(steps_per_epoch),
                 "phase_steps": int(steps_this_phase),
                 "target_max_train_steps": int(cumulative_steps),
                 "target_epoch_end": int(cumulative_epochs),
                 "batch_size": int(batch_this_phase),
+                "gradient_accumulation_steps_factor": float(gradient_accumulation_factor),
+                "gradient_accumulation_steps": int(gradient_accumulation_steps_this_phase),
                 "save_every_n_epochs_factor": float(sample_factor),
                 "save_every_n_epochs": int(save_every_n_epochs_this_phase),
                 "sample_every_n_epochs_factor": float(sample_factor),
@@ -434,10 +463,12 @@ def _build_mixed_resolution_plan(
         "save_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
         "base_resolution": f"{base_side},{base_side}",
         "base_batch_size": int(base_batch),
+        "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
         "base_epochs": int(base_epochs),
         "total_train_images_with_repeats": int(total_train_images),
         "total_mixed_epochs": int(cumulative_epochs),
         "total_mixed_steps": int(cumulative_steps),
+        "gradient_accumulation_steps_rule": "x=1 -> all phases keep 1; x>1 -> all phases keep x (anchored to 1024 baseline)",
         "phases": phase_configs,
     }
     return plan, ""
@@ -2011,6 +2042,7 @@ def run_train(toml_path: str,
                 "[staged-resolution] enabled: "
                 f"base={mixed_resolution_plan['base_resolution']}, "
                 f"base_batch={mixed_resolution_plan['base_batch_size']}, "
+                f"base_grad_accum={mixed_resolution_plan.get('base_gradient_accumulation_steps')}, "
                 f"base_epochs={mixed_resolution_plan['base_epochs']}, "
                 f"ratio_sum_percent={mixed_resolution_plan.get('configured_ratio_sum_percent')}, "
                 f"base_save_every_n_epochs={mixed_resolution_plan.get('save_every_n_epochs')}, "
@@ -2022,18 +2054,21 @@ def run_train(toml_path: str,
             )
             for phase in mixed_resolution_plan["phases"]:
                 log.info(
-                    "[staged-resolution] phase %s: res=%s ratio_percent=%s batch=%s save_every_n_epochs=%s sample_every_n_epochs=%s "
-                    "raw_epochs=%s epochs=%s rounding_multiple=%s steps/epoch=%s "
+                    "[staged-resolution] phase %s: res=%s ratio_percent=%s batch=%s grad_accum=%s "
+                    "save_every_n_epochs=%s sample_every_n_epochs=%s "
+                    "raw_epochs=%s epochs=%s rounding_multiple=%s batches/epoch=%s steps/epoch=%s "
                     "phase_steps=%s target_max_steps=%s target_epoch_end=%s cache_rebuild=%s toml=%s",
                     phase["phase_index"],
                     phase["resolution"],
                     phase.get("ratio_percent"),
                     phase["batch_size"],
+                    phase.get("gradient_accumulation_steps"),
                     phase.get("save_every_n_epochs"),
                     phase.get("sample_every_n_epochs"),
                     phase.get("raw_epochs"),
                     phase["epochs"],
                     phase.get("epoch_rounding_multiple"),
+                    phase.get("batches_per_epoch"),
                     phase["steps_per_epoch"],
                     phase["phase_steps"],
                     phase["target_max_train_steps"],
