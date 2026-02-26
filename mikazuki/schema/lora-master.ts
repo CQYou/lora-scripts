@@ -41,6 +41,9 @@ Schema.intersect([
         network_train_text_encoder_only: Schema.boolean().default(false).description("仅训练文本编码器"),
     }).description("训练相关参数"),
 
+    // 阶段分辨率训练设置（放在训练参数与学习率设置之间）
+    SHARED_SCHEMAS.MIXED_RESOLUTION_TRAINING,
+
     // 学习率&优化器设置
     SHARED_SCHEMAS.LR_OPTIMIZER,
 

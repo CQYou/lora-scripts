@@ -896,7 +896,8 @@ class NetworkTrainer:
 
         if not explicit_initial_override and epoch_from_state is not None:
             try:
-                state_epoch_to_start = max(0, int(epoch_from_state) - 1)
+                resume_epoch_offset = int(getattr(args, "resume_epoch_offset", 0) or 0)
+                state_epoch_to_start = max(0, int(epoch_from_state) - 1 + resume_epoch_offset)
                 if state_epoch_to_start != step_based_epoch_to_start:
                     logger.warning(
                         "resume epoch mismatch detected: state epoch=%s, step-derived epoch=%s (step=%s, batches_per_epoch=%s). "
@@ -1331,6 +1332,13 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="initial step number including all epochs, 0 means first step (same as not specifying). overwrites initial_epoch."
         + " / 初期ステップ数、全エポックを含むステップ数、0で最初のステップ（未指定時と同じ）。initial_epochを上書きする",
+    )
+    parser.add_argument(
+        "--resume_epoch_offset",
+        type=int,
+        default=0,
+        help="offset applied to resumed current_epoch before converting to loop start (default: 0)"
+        + " / resume時にstateのcurrent_epochへ加算するオフセット（デフォルト: 0）",
     )
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")

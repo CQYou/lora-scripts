@@ -20,6 +20,16 @@ Schema.intersect([
         train_batch_size: Schema.number().min(1).default(1).description("批量大小"),
     }).description("训练相关参数"),
 
+    Schema.object({
+        enable_mixed_resolution_training: Schema.boolean().default(false).description(
+            "启用阶段分辨率训练（512 -> 768 -> 1024 三阶段自动切换）。" +
+            "将按像素量自动换算 batch/epoch/steps，阶段切换时自动清理并重建缓存。"
+        ),
+        staged_resolution_ratio_512: Schema.number().min(0).max(100).step(1).default(40).description("512 阶段占比（%），范围 0~100"),
+        staged_resolution_ratio_768: Schema.number().min(0).max(100).step(1).default(30).description("768 阶段占比（%），范围 0~100"),
+        staged_resolution_ratio_1024: Schema.number().min(0).max(100).step(1).default(30).description("1024 阶段占比（%），范围 0~100。三个占比总和不能大于 100"),
+    }).description("阶段分辨率训练"),
+
     Schema.intersect([
         Schema.object({
             unet_lr: Schema.string().default("1e-4").description("U-Net 学习率"),

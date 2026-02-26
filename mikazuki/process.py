@@ -1,6 +1,8 @@
 
 import asyncio
+import copy
 import json
+import math
 import os
 import re
 import shlex
@@ -24,7 +26,8 @@ from mikazuki.launch_utils import base_dir_path
 LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
     "train_batch_size,gradient_accumulation_steps,max_train_epochs,"
     "learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,"
-    "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"
+    "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,"
+    "staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"
 )
 DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
@@ -33,6 +36,25 @@ DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
 MESH_NET_MONITOR_INTERVAL_SECONDS = 10
 CKPT_EXTENSIONS = {".safetensors", ".ckpt", ".pt"}
 TB_EVENT_FILE_GLOB = "events.out.tfevents.*"
+MIXED_RESOLUTION_ENABLE_KEY = "enable_mixed_resolution_training"
+MIXED_RESOLUTION_PHASE_SIDES = (512, 768, 1024)
+MIXED_RESOLUTION_RATIO_CONFIG_KEYS = {
+    512: "staged_resolution_ratio_512",
+    768: "staged_resolution_ratio_768",
+    1024: "staged_resolution_ratio_1024",
+}
+MIXED_RESOLUTION_RATIO_DEFAULTS = {
+    512: 40.0,
+    768: 30.0,
+    1024: 30.0,
+}
+MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS = {
+    512: 4.0,
+    768: 1.78,
+    1024: 1.0,
+}
+MIXED_RESOLUTION_RESUME_SENTINEL = "__MIXED_AUTO_RESUME__"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
 
 def _to_bool(value, default=False):
@@ -69,6 +91,307 @@ def _parse_sync_config_keys(value):
         return ["*"]
 
     return keys
+
+
+def _parse_resolution_pair(value: str) -> Optional[tuple[int, int]]:
+    raw = str(value or "").strip().lower().replace("x", ",")
+    if not raw:
+        return None
+
+    parts = [x.strip() for x in raw.split(",") if x.strip()]
+    try:
+        if len(parts) == 1:
+            side = int(parts[0])
+            if side <= 0:
+                return None
+            return side, side
+        width = int(parts[0])
+        height = int(parts[1])
+    except Exception:
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _ceil_to_multiple(value: int, base: int) -> int:
+    if base <= 0:
+        return value
+    return int(math.ceil(value / base) * base)
+
+
+def _gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return abs(a)
+
+
+def _lcm(a: int, b: int) -> int:
+    if a <= 0:
+        return max(1, b)
+    if b <= 0:
+        return max(1, a)
+    return abs(a * b) // _gcd(a, b)
+
+
+def _scale_epoch_interval(base_value: int, factor: float) -> int:
+    return max(1, int(math.ceil(max(1, int(base_value)) * float(factor))))
+
+
+def _load_staged_phase_ratios(config: dict) -> tuple[list[tuple[int, float, float]], str]:
+    configured = []
+    ratio_sum = 0.0
+
+    for side in MIXED_RESOLUTION_PHASE_SIDES:
+        key = MIXED_RESOLUTION_RATIO_CONFIG_KEYS[side]
+        default_percent = MIXED_RESOLUTION_RATIO_DEFAULTS[side]
+        raw_value = config.get(key, default_percent)
+        try:
+            percent = float(raw_value)
+        except Exception:
+            return [], f"{key} 无法解析为数字: {raw_value}"
+
+        if not math.isfinite(percent):
+            return [], f"{key} 不是有效数字: {raw_value}"
+        if percent < 0 or percent > 100:
+            return [], f"{key} 超出范围: {percent}（仅允许 0~100）"
+
+        ratio_sum += percent
+        configured.append((side, percent / 100.0, percent))
+
+    if ratio_sum > 100 + 1e-9:
+        return [], (
+            "阶段分辨率占比总和不能大于 100："
+            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[512]} + "
+            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[768]} + "
+            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[1024]} = {ratio_sum:.4f}"
+        )
+
+    active = [item for item in configured if item[2] > 0]
+    if not active:
+        return [], "阶段分辨率占比总和为 0，至少需要一个阶段占比大于 0"
+
+    return active, ""
+
+
+def _count_images_recursive(path: Path) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+
+    count = 0
+    for file in path.rglob("*"):
+        if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS:
+            count += 1
+    return count
+
+
+def _count_train_images_with_repeats(config: dict, repo_root: Path) -> int:
+    train_data_dir = str(config.get("train_data_dir", "") or "").strip()
+    if not train_data_dir:
+        return 0
+
+    train_root = _resolve_local_path(train_data_dir, repo_root)
+    if not train_root.exists() or not train_root.is_dir():
+        return 0
+
+    repeat_subsets = []
+    try:
+        subdirs = sorted([p for p in train_root.iterdir() if p.is_dir()])
+    except Exception:
+        subdirs = []
+
+    for subdir in subdirs:
+        match = re.match(r"^(\d+)_", subdir.name)
+        if not match:
+            continue
+        repeats = max(1, int(match.group(1)))
+        image_count = _count_images_recursive(subdir)
+        repeat_subsets.append((repeats, image_count, subdir))
+
+    if repeat_subsets:
+        total = sum(repeats * image_count for repeats, image_count, _ in repeat_subsets)
+        return total
+
+    # fallback: no repeat-style subset folder found
+    return _count_images_recursive(train_root)
+
+
+def _build_mixed_resolution_plan(
+    config: dict,
+    toml_path: str,
+    trainer_file: str,
+    *,
+    save_every_n_epochs_default: int = 1,
+):
+    if not _to_bool(config.get(MIXED_RESOLUTION_ENABLE_KEY), False):
+        return None, ""
+
+    trainer_name = Path(str(trainer_file)).name
+    if trainer_name not in {"train_network.py", "sdxl_train_network.py"}:
+        return None, f"当前训练脚本不支持阶段分辨率训练: {trainer_name}"
+
+    resolution = _parse_resolution_pair(str(config.get("resolution", "") or ""))
+    if resolution is None:
+        return None, f"无法解析训练分辨率: {config.get('resolution')}"
+    width, height = resolution
+    if width != height:
+        return None, "阶段分辨率训练目前仅支持正方形分辨率（如 1024,1024）"
+
+    base_side = int(width)
+    if base_side != 1024:
+        return None, "当前阶段分辨率流程固定为 512 -> 768 -> 1024，基础分辨率必须设置为 1024,1024"
+    base_pixels = base_side * base_side
+
+    try:
+        base_epochs = int(config.get("max_train_epochs"))
+    except Exception:
+        base_epochs = 0
+    if base_epochs <= 0:
+        return None, "启用阶段分辨率训练时，max_train_epochs 必须大于 0"
+
+    try:
+        base_batch = int(config.get("train_batch_size"))
+    except Exception:
+        base_batch = 0
+    if base_batch <= 0:
+        return None, "启用阶段分辨率训练时，train_batch_size 必须大于 0"
+
+    try:
+        save_every_n_epochs = int(config.get("save_every_n_epochs", save_every_n_epochs_default) or save_every_n_epochs_default)
+    except Exception:
+        save_every_n_epochs = save_every_n_epochs_default
+    if save_every_n_epochs <= 0:
+        save_every_n_epochs = 1
+
+    preview_enabled = _to_bool(config.get("enable_preview", False), False)
+    try:
+        base_sample_every_n_epochs = int(config.get("sample_every_n_epochs", 1) or 1)
+    except Exception:
+        base_sample_every_n_epochs = 1
+    if base_sample_every_n_epochs <= 0:
+        base_sample_every_n_epochs = 1
+
+    configured_phases, ratio_error = _load_staged_phase_ratios(config)
+    if ratio_error:
+        return None, ratio_error
+    configured_ratio_sum_percent = sum(item[2] for item in configured_phases)
+
+    repo_root = base_dir_path()
+    total_train_images = _count_train_images_with_repeats(config, repo_root)
+    if total_train_images <= 0:
+        return None, "无法统计训练图像数量，无法生成阶段分辨率训练计划"
+
+    plan_base = Path(toml_path)
+    phase_configs = []
+    cumulative_epochs = 0
+    cumulative_steps = 0
+    previous_side = None
+
+    for idx, (side, ratio, ratio_percent) in enumerate(configured_phases, start=1):
+        target_pixels = side * side
+        batch_this_phase = max(1, int(math.floor(base_batch * (base_pixels / target_pixels))))
+
+        sample_factor = float(MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS.get(side, base_pixels / target_pixels))
+        save_every_n_epochs_this_phase = _scale_epoch_interval(save_every_n_epochs, sample_factor)
+        sample_every_n_epochs_this_phase = _scale_epoch_interval(base_sample_every_n_epochs, sample_factor)
+        epoch_rounding_multiple = int(save_every_n_epochs_this_phase)
+        if preview_enabled:
+            epoch_rounding_multiple = _lcm(epoch_rounding_multiple, sample_every_n_epochs_this_phase)
+
+        # Raw formula: ceil(base_epochs * phase_ratio * (phase_batch / base_batch))
+        raw_epochs_this_phase = int(math.ceil(base_epochs * ratio * (batch_this_phase / base_batch)))
+        # Actual formula: ceil_to_multiple(raw_epochs, lcm(save_every_n_epochs, sample_every_n_epochs_phase))
+        epochs_this_phase = _ceil_to_multiple(max(1, raw_epochs_this_phase), epoch_rounding_multiple)
+        steps_per_epoch = max(1, int(math.ceil(total_train_images / batch_this_phase)))
+        steps_this_phase = int(epochs_this_phase * steps_per_epoch)
+
+        cumulative_epochs += int(epochs_this_phase)
+        cumulative_steps += int(steps_this_phase)
+
+        phase_toml_path = plan_base.with_name(f"{plan_base.stem}-staged-phase{idx}.toml")
+        phase_config = copy.deepcopy(config)
+        phase_config[MIXED_RESOLUTION_ENABLE_KEY] = False
+        phase_config["resolution"] = f"{side},{side}"
+        phase_config["train_batch_size"] = int(batch_this_phase)
+        phase_config["max_train_steps"] = int(cumulative_steps)
+        phase_config.pop("max_train_epochs", None)
+        phase_config.pop("resume_epoch_offset", None)
+        phase_config["save_state"] = True
+        phase_config["save_every_n_epochs"] = int(save_every_n_epochs_this_phase)
+        if preview_enabled:
+            phase_config["sample_every_n_epochs"] = int(sample_every_n_epochs_this_phase)
+        if idx > 1:
+            phase_config["resume"] = MIXED_RESOLUTION_RESUME_SENTINEL
+
+        with open(phase_toml_path, "w", encoding="utf-8") as f:
+            toml.dump(phase_config, f)
+
+        raw_formula = (
+            f"ceil({base_epochs} * ({ratio_percent:g} / 100) * ({batch_this_phase} / {base_batch}))"
+        )
+        if preview_enabled:
+            actual_formula = (
+                "ceil_to_multiple(raw_epochs, "
+                f"lcm(save_every_n_epochs={save_every_n_epochs_this_phase}, "
+                f"sample_every_n_epochs={sample_every_n_epochs_this_phase})={epoch_rounding_multiple})"
+            )
+        else:
+            actual_formula = (
+                "ceil_to_multiple(raw_epochs, "
+                f"save_every_n_epochs={save_every_n_epochs_this_phase})"
+            )
+
+        phase_configs.append(
+            {
+                "phase_index": idx,
+                "toml_path": str(phase_toml_path),
+                "resolution_side": int(side),
+                "resolution": f"{side},{side}",
+                "ratio": float(ratio),
+                "ratio_percent": float(ratio_percent),
+                "raw_epochs": int(raw_epochs_this_phase),
+                "epochs": int(epochs_this_phase),
+                "raw_epochs_formula": raw_formula,
+                "actual_epochs_formula": actual_formula,
+                "steps_per_epoch": int(steps_per_epoch),
+                "phase_steps": int(steps_this_phase),
+                "target_max_train_steps": int(cumulative_steps),
+                "target_epoch_end": int(cumulative_epochs),
+                "batch_size": int(batch_this_phase),
+                "save_every_n_epochs_factor": float(sample_factor),
+                "save_every_n_epochs": int(save_every_n_epochs_this_phase),
+                "sample_every_n_epochs_factor": float(sample_factor),
+                "sample_every_n_epochs": int(sample_every_n_epochs_this_phase),
+                "epoch_rounding_multiple": int(epoch_rounding_multiple),
+                "clear_cache_before_start": previous_side is not None and previous_side != side,
+            }
+        )
+        previous_side = side
+
+    plan = {
+        "enabled": True,
+        "base_config_toml": str(toml_path),
+        "trainer_file": str(trainer_file),
+        "phase_count": len(phase_configs),
+        "save_every_n_epochs": int(save_every_n_epochs),
+        "configured_ratio_sum_percent": float(configured_ratio_sum_percent),
+        "configured_phase_ratios_percent": {
+            str(side): float(percent) for side, _, percent in configured_phases
+        },
+        "preview_enabled": bool(preview_enabled),
+        "base_sample_every_n_epochs": int(base_sample_every_n_epochs),
+        "sample_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
+        "save_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
+        "base_resolution": f"{base_side},{base_side}",
+        "base_batch_size": int(base_batch),
+        "base_epochs": int(base_epochs),
+        "total_train_images_with_repeats": int(total_train_images),
+        "total_mixed_epochs": int(cumulative_epochs),
+        "total_mixed_steps": int(cumulative_steps),
+        "phases": phase_configs,
+    }
+    return plan, ""
 
 
 def _list_local_network_interfaces() -> list[str]:
@@ -1101,12 +1424,10 @@ def run_train(toml_path: str,
               cpu_threads: Optional[int] = 2,
               distributed_config: Optional[dict] = None):
     log.info(f"Training started with config file / 训练开始，使用配置文件: {toml_path}")
-    args = [
+    base_accelerate_args = [
         sys.executable, "-m", "accelerate.commands.launch",  # use -m to avoid python script executable error
         "--num_cpu_threads_per_process", str(cpu_threads),  # cpu threads
         "--quiet",  # silence accelerate error message
-        trainer_file,
-        "--config_file", toml_path,
     ]
 
     customize_env = os.environ.copy()
@@ -1304,7 +1625,81 @@ def run_train(toml_path: str,
         if sys.platform == "win32":
             customize_env["USE_LIBUV"] = "0"
             launch_args += ["--rdzv_backend", "c10d"]
-        args[3:3] = launch_args
+
+    args = None
+    mixed_resolution_plan = None
+    if runtime_train_config and _to_bool(runtime_train_config.get(MIXED_RESOLUTION_ENABLE_KEY), False):
+        mixed_resolution_plan, mixed_plan_error = _build_mixed_resolution_plan(
+            runtime_train_config,
+            toml_path,
+            trainer_file,
+        )
+        if mixed_plan_error:
+            return APIResponse(status="error", message=f"阶段分辨率训练配置错误: {mixed_plan_error}")
+
+        if mixed_resolution_plan is not None:
+            mixed_resolution_plan["cpu_threads"] = int(cpu_threads)
+            mixed_resolution_plan["launch_args"] = list(launch_args)
+            mixed_resolution_plan["repo_root"] = str(repo_root)
+
+            mixed_plan_file = Path(toml_path).with_name(f"{Path(toml_path).stem}-staged-plan.json")
+            with open(mixed_plan_file, "w", encoding="utf-8") as f:
+                json.dump(mixed_resolution_plan, f, ensure_ascii=False, indent=2)
+
+            log.info(
+                "[staged-resolution] enabled: "
+                f"base={mixed_resolution_plan['base_resolution']}, "
+                f"base_batch={mixed_resolution_plan['base_batch_size']}, "
+                f"base_epochs={mixed_resolution_plan['base_epochs']}, "
+                f"ratio_sum_percent={mixed_resolution_plan.get('configured_ratio_sum_percent')}, "
+                f"base_save_every_n_epochs={mixed_resolution_plan.get('save_every_n_epochs')}, "
+                f"preview_enabled={'yes' if mixed_resolution_plan.get('preview_enabled') else 'no'}, "
+                f"base_sample_every_n_epochs={mixed_resolution_plan.get('base_sample_every_n_epochs')}, "
+                f"total_epochs={mixed_resolution_plan['total_mixed_epochs']}, "
+                f"total_steps={mixed_resolution_plan['total_mixed_steps']}"
+            )
+            for phase in mixed_resolution_plan["phases"]:
+                log.info(
+                    "[staged-resolution] phase %s: res=%s ratio_percent=%s batch=%s save_every_n_epochs=%s sample_every_n_epochs=%s "
+                    "raw_epochs=%s epochs=%s rounding_multiple=%s steps/epoch=%s "
+                    "phase_steps=%s target_max_steps=%s target_epoch_end=%s cache_rebuild=%s toml=%s",
+                    phase["phase_index"],
+                    phase["resolution"],
+                    phase.get("ratio_percent"),
+                    phase["batch_size"],
+                    phase.get("save_every_n_epochs"),
+                    phase.get("sample_every_n_epochs"),
+                    phase.get("raw_epochs"),
+                    phase["epochs"],
+                    phase.get("epoch_rounding_multiple"),
+                    phase["steps_per_epoch"],
+                    phase["phase_steps"],
+                    phase["target_max_train_steps"],
+                    phase["target_epoch_end"],
+                    "yes" if phase["clear_cache_before_start"] else "no",
+                    phase["toml_path"],
+                )
+                log.info(
+                    "[staged-resolution] phase %s formulas: raw='%s', actual='%s'",
+                    phase["phase_index"],
+                    phase.get("raw_epochs_formula"),
+                    phase.get("actual_epochs_formula"),
+                )
+
+            args = [
+                sys.executable,
+                "-m",
+                "mikazuki.mixed_resolution_runner",
+                "--plan-file",
+                str(mixed_plan_file),
+            ]
+
+    if args is None:
+        args = list(base_accelerate_args) + list(launch_args) + [
+            trainer_file,
+            "--config_file",
+            toml_path,
+        ]
 
     if not (task := tm.create_task(args, customize_env)):
         return APIResponse(status="error", message="Failed to create task / 无法创建训练任务")

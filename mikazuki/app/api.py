@@ -103,7 +103,11 @@ async def load_schemas():
     avaliable_schemas.clear()
 
     schema_dir = os.path.join(os.getcwd(), "mikazuki", "schema")
-    schemas = os.listdir(schema_dir)
+    schemas = [
+        name for name in os.listdir(schema_dir)
+        if name.lower().endswith(".ts") and os.path.isfile(os.path.join(schema_dir, name))
+    ]
+    schemas.sort(key=lambda name: (0 if name == "shared.ts" else 1, name.lower()))
     network_interface_options = _get_network_interface_options()
     detected_repo_root = os.getcwd()
 
@@ -120,7 +124,7 @@ async def load_schemas():
             )
             content = runtime_prelude + content
             avaliable_schemas.append({
-                "name": schema_name.rstrip(".ts"),
+                "name": Path(schema_name).stem,
                 "schema": content,
                 "hash": lambda_hash(content)
             })
@@ -222,7 +226,7 @@ async def create_toml_file(request: Request):
         "sync_use_password_auth": pop_sync_value("sync_use_password_auth", True),
         "sync_ssh_password": pop_sync_value("sync_ssh_password", ""),
         "sync_config_from_main": pop_sync_value("sync_config_from_main", True),
-        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"),
+        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"),
         "sync_missing_assets_from_main": pop_sync_value("sync_missing_assets_from_main", True),
         "sync_asset_keys": pop_sync_value("sync_asset_keys", "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"),
         "sync_main_repo_dir": pop_sync_value("sync_main_repo_dir", os.getcwd()),

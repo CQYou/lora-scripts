@@ -27,6 +27,7 @@ config/presets/test*.toml
 !logs/.keep
 
 tests/
+node_modules/
 
 huggingface/*
 !huggingface/.keep
