@@ -42,6 +42,9 @@ def sample_images(
     prompt_replacement=None,
     controlnet=None,
 ):
+    if epoch == 0 and getattr(args, "resume", None):
+        return
+
     if steps == 0:
         if not args.sample_at_first:
             return

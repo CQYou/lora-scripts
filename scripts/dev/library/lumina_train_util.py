@@ -130,6 +130,9 @@ def sample_images(
     Returns:
         None
     """
+    if epoch == 0 and getattr(args, "resume", None):
+        return
+
     if global_step == 0:
         if not args.sample_at_first:
             return

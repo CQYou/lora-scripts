@@ -382,6 +382,9 @@ def sample_images(
     sample_prompts_te_outputs,
     prompt_replacement=None,
 ):
+    if epoch == 0 and getattr(args, "resume", None):
+        return
+
     if steps == 0:
         if not args.sample_at_first:
             return

@@ -6656,6 +6656,11 @@ def sample_images_common(
     TODO Use strategies here
     """
 
+    # When resuming, skip the startup "epoch 0" sampling call.
+    # Keep periodic sampling behavior unchanged after training starts.
+    if epoch == 0 and getattr(args, "resume", None):
+        return
+
     if steps == 0:
         if not args.sample_at_first:
             return

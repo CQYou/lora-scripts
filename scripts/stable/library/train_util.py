@@ -5755,6 +5755,11 @@ def sample_images_common(
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
     """
 
+    # When resuming, skip the startup "epoch 0" sampling call.
+    # Keep periodic sampling behavior unchanged after training starts.
+    if epoch == 0 and getattr(args, "resume", None):
+        return
+
     if steps == 0:
         if not args.sample_at_first:
             return
@@ -5862,18 +5867,16 @@ def sample_images_common(
                         accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement, controlnet=controlnet
                     )
 
-    # clear pipeline and cache to reduce vram usage
+    # clear pipeline references first
     del pipeline
-
-    # I'm not sure which of these is the correct way to clear the memory, but accelerator's device is used in the pipeline, so I'm using it here.
-    # with torch.cuda.device(torch.cuda.current_device()):
-    #     torch.cuda.empty_cache()
-    clean_memory_on_device(accelerator.device)
 
     torch.set_rng_state(rng_state)
     if torch.cuda.is_available() and cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
     vae.to(org_vae_device)
+
+    # run cache cleanup after restoring VAE device so moved-out allocations can be reclaimed
+    clean_memory_on_device(accelerator.device)
 
 
 def sample_image_inference(
