@@ -1,6 +1,7 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import os
@@ -55,6 +56,15 @@ MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS = {
 }
 MIXED_RESOLUTION_RESUME_SENTINEL = "__MIXED_AUTO_RESUME__"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+BATCH_PROBE_MAX_CANDIDATE = 512
+BATCH_PROBE_MAX_TRIALS = 7
+BATCH_PROBE_TIMEOUT_SECONDS = 600
+BATCH_PROBE_OOM_PATTERNS = [
+    re.compile(r"cuda out of memory", re.IGNORECASE),
+    re.compile(r"cudnn_status_alloc_failed", re.IGNORECASE),
+    re.compile(r"out of memory", re.IGNORECASE),
+    re.compile(r"allocator.*memory", re.IGNORECASE),
+]
 
 
 def _to_bool(value, default=False):
@@ -284,6 +294,27 @@ def _build_mixed_resolution_plan(
         return None, ratio_error
     configured_ratio_sum_percent = sum(item[2] for item in configured_phases)
 
+    plan_signature_payload = {
+        "trainer_name": trainer_name,
+        "base_resolution": [base_side, base_side],
+        "base_epochs": int(base_epochs),
+        "base_batch": int(base_batch),
+        "save_every_n_epochs": int(save_every_n_epochs),
+        "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
+        "base_sample_every_n_epochs": int(base_sample_every_n_epochs) if base_sample_every_n_epochs is not None else None,
+        "configured_phases": [
+            {
+                "side": int(side),
+                "ratio": float(ratio),
+                "ratio_percent": float(ratio_percent),
+            }
+            for side, ratio, ratio_percent in configured_phases
+        ],
+    }
+    plan_id = hashlib.sha1(
+        json.dumps(plan_signature_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+
     repo_root = base_dir_path()
     total_train_images = _count_train_images_with_repeats(config, repo_root)
     if total_train_images <= 0:
@@ -327,6 +358,9 @@ def _build_mixed_resolution_plan(
         phase_config.pop("max_train_epochs", None)
         phase_config.pop("resume_epoch_offset", None)
         phase_config["save_state"] = True
+        phase_config["staged_plan_id"] = plan_id
+        phase_config["staged_phase_index"] = int(idx)
+        phase_config["staged_phase_target_max_train_steps"] = int(cumulative_steps)
         phase_config["save_every_n_epochs"] = int(save_every_n_epochs_this_phase)
         if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             phase_config["sample_every_n_epochs"] = int(sample_every_n_epochs_this_phase)
@@ -357,6 +391,7 @@ def _build_mixed_resolution_plan(
             {
                 "phase_index": idx,
                 "toml_path": str(phase_toml_path),
+                "plan_id": plan_id,
                 "resolution_side": int(side),
                 "resolution": f"{side},{side}",
                 "ratio": float(ratio),
@@ -382,6 +417,8 @@ def _build_mixed_resolution_plan(
 
     plan = {
         "enabled": True,
+        "plan_id": plan_id,
+        "plan_signature_payload": plan_signature_payload,
         "base_config_toml": str(toml_path),
         "trainer_file": str(trainer_file),
         "phase_count": len(phase_configs),
@@ -1428,6 +1465,318 @@ def _enforce_distributed_output_policy(toml_path: str, machine_rank: int) -> Tup
         log.info("[output-policy] worker native save is enabled (no checkpoint/save_state override)")
 
     return True, ""
+
+
+def _batch_probe_is_oom(log_text: str) -> bool:
+    if not log_text:
+        return False
+    return any(pattern.search(log_text) for pattern in BATCH_PROBE_OOM_PATTERNS)
+
+
+def _batch_probe_tail(log_text: str, *, max_lines: int = 60, max_chars: int = 4000) -> str:
+    if not log_text:
+        return ""
+    lines = log_text.splitlines()
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
+def _prepare_batch_probe_base_config(config: dict, trainer_file: str) -> Tuple[Optional[dict], str]:
+    probe_config = copy.deepcopy(config)
+
+    pretrained_model = str(probe_config.get("pretrained_model_name_or_path", "") or "").strip()
+    if not pretrained_model:
+        return None, "缺少底模路径（pretrained_model_name_or_path）"
+
+    train_data_dir = str(probe_config.get("train_data_dir", "") or "").strip()
+    if not train_data_dir:
+        return None, "缺少训练数据集路径（train_data_dir）"
+
+    resolution_raw = str(probe_config.get("resolution", "") or "").strip()
+    if _parse_resolution_pair(resolution_raw) is None:
+        return None, f"训练分辨率无效：{resolution_raw}"
+
+    try:
+        base_batch = int(probe_config.get("train_batch_size", 1))
+    except Exception:
+        base_batch = 1
+    if base_batch <= 0:
+        base_batch = 1
+
+    trainer_name = Path(str(trainer_file)).name
+    if trainer_name in {"train_network.py", "sdxl_train_network.py"}:
+        if not str(probe_config.get("network_module", "") or "").strip():
+            probe_config["network_module"] = "networks.lora"
+        if probe_config.get("network_dim") in (None, ""):
+            probe_config["network_dim"] = 32
+        if probe_config.get("network_alpha") in (None, ""):
+            probe_config["network_alpha"] = 32
+
+    probe_config["train_batch_size"] = int(base_batch)
+    probe_config[MIXED_RESOLUTION_ENABLE_KEY] = False
+
+    # Keep the real training path but force it to a single short step.
+    probe_config["max_train_steps"] = 1
+    probe_config.pop("max_train_epochs", None)
+    probe_config.pop("resume", None)
+
+    # Disable periodic save/sample; final model save by trainer is cleaned after trial.
+    probe_config["save_every_n_epochs"] = 10**9
+    probe_config.pop("save_every_n_steps", None)
+    probe_config["save_state"] = False
+    probe_config["save_state_on_train_end"] = False
+    probe_config.pop("save_last_n_epochs_state", None)
+    probe_config.pop("save_last_n_steps_state", None)
+    probe_config.pop("save_last_n_epochs", None)
+    probe_config.pop("save_last_n_steps", None)
+    probe_config["enable_preview"] = False
+    probe_config.pop("sample_prompts", None)
+    probe_config.pop("sample_every_n_epochs", None)
+    probe_config.pop("sample_sampler", None)
+
+    # Avoid external tracker failures in probe mode.
+    if str(probe_config.get("log_with", "") or "").strip().lower() == "wandb":
+        probe_config["log_with"] = "tensorboard"
+    probe_config.pop("wandb_api_key", None)
+
+    return probe_config, ""
+
+
+def _run_single_batch_probe(
+    probe_base_config: dict,
+    trainer_file: str,
+    *,
+    batch_size: int,
+    trial_index: int,
+    gpu_ids: Optional[list] = None,
+    cpu_threads: int = 2,
+) -> dict:
+    repo_root = base_dir_path()
+    trial_root = (Path("/tmp") / "mikazuki-batch-probe" / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / f"trial-{trial_index:02d}-b{batch_size}").resolve()
+    output_dir = trial_root / "output"
+    logging_dir = trial_root / "logs"
+    toml_path = trial_root / "probe.toml"
+
+    trial_root.mkdir(parents=True, exist_ok=True)
+
+    probe_config = copy.deepcopy(probe_base_config)
+    probe_config["train_batch_size"] = int(batch_size)
+    probe_config["output_dir"] = str(output_dir)
+    probe_config["logging_dir"] = str(logging_dir)
+    probe_config["output_name"] = f"batch-probe-b{batch_size}"
+
+    with open(toml_path, "w", encoding="utf-8") as f:
+        f.write(toml.dumps(probe_config))
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "accelerate.commands.launch",
+        "--num_cpu_threads_per_process",
+        str(max(1, int(cpu_threads))),
+        "--quiet",
+        str(trainer_file),
+        "--config_file",
+        str(toml_path),
+    ]
+
+    env = os.environ.copy()
+    env["ACCELERATE_DISABLE_RICH"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONWARNINGS"] = "ignore::FutureWarning,ignore::UserWarning"
+    if gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+
+    started_at = time.time()
+    output_text = ""
+    status = "error"
+    reason = ""
+    return_code = -1
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=BATCH_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        return_code = int(result.returncode)
+        output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+        if return_code == 0:
+            status = "success"
+            reason = "ok"
+        elif _batch_probe_is_oom(output_text):
+            status = "oom"
+            reason = "oom"
+        else:
+            status = "error"
+            reason = f"non-oom error (code={return_code})"
+    except subprocess.TimeoutExpired as e:
+        output_text = ((e.stdout or "") if isinstance(e.stdout, str) else "") + "\n" + ((e.stderr or "") if isinstance(e.stderr, str) else "")
+        status = "timeout"
+        reason = f"timeout>{BATCH_PROBE_TIMEOUT_SECONDS}s"
+    except Exception as e:
+        status = "error"
+        reason = f"probe exception: {e}"
+    finally:
+        try:
+            shutil.rmtree(trial_root, ignore_errors=True)
+        except Exception:
+            pass
+
+    return {
+        "batch_size": int(batch_size),
+        "status": status,
+        "reason": reason,
+        "return_code": int(return_code),
+        "elapsed_sec": round(max(0.0, time.time() - started_at), 3),
+        "log_tail": _batch_probe_tail(output_text),
+    }
+
+
+def probe_recommended_batch_size(
+    config: dict,
+    trainer_file: str,
+    *,
+    gpu_ids: Optional[list] = None,
+    cpu_threads: int = 2,
+    max_trials: int = BATCH_PROBE_MAX_TRIALS,
+    hard_cap: int = BATCH_PROBE_MAX_CANDIDATE,
+) -> dict:
+    probe_base_config, prep_error = _prepare_batch_probe_base_config(config, trainer_file)
+    if probe_base_config is None:
+        return {"ok": False, "message": prep_error, "data": {"trials": []}}
+
+    try:
+        start_batch = int(probe_base_config.get("train_batch_size", 1))
+    except Exception:
+        start_batch = 1
+    start_batch = max(1, start_batch)
+    hard_cap = max(start_batch, int(hard_cap))
+    max_trials = max(1, int(max_trials))
+
+    trials = []
+    trial_index = 0
+
+    def run_candidate(candidate_batch: int) -> dict:
+        nonlocal trial_index
+        trial_index += 1
+        result = _run_single_batch_probe(
+            probe_base_config,
+            trainer_file,
+            batch_size=int(candidate_batch),
+            trial_index=trial_index,
+            gpu_ids=gpu_ids,
+            cpu_threads=cpu_threads,
+        )
+        trials.append(result)
+        log.info(
+            "[batch-probe] trial=%s batch=%s status=%s reason=%s elapsed=%.3fs",
+            trial_index,
+            result["batch_size"],
+            result["status"],
+            result["reason"],
+            result["elapsed_sec"],
+        )
+        return result
+
+    first = run_candidate(start_batch)
+    if first["status"] == "timeout":
+        return {
+            "ok": False,
+            "message": "batch 检测超时，请检查模型/数据路径或减少复杂配置后重试。",
+            "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+        }
+    if first["status"] == "error":
+        return {
+            "ok": False,
+            "message": "batch 检测失败（非显存错误），请先修复当前训练配置。",
+            "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+        }
+
+    best_batch = 0
+    if first["status"] == "oom":
+        low = 1
+        high = start_batch - 1
+        while low <= high and trial_index < max_trials:
+            mid = (low + high) // 2
+            result = run_candidate(mid)
+            if result["status"] == "success":
+                best_batch = mid
+                low = mid + 1
+            elif result["status"] == "oom":
+                high = mid - 1
+            else:
+                return {
+                    "ok": False,
+                    "message": "batch 检测中遇到非显存错误，已中止。",
+                    "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+                }
+    else:
+        best_batch = start_batch
+        failure_batch = None
+        current = start_batch
+
+        while trial_index < max_trials and current < hard_cap:
+            next_batch = min(hard_cap, max(current + 1, current * 2))
+            if next_batch <= current:
+                break
+            result = run_candidate(next_batch)
+            if result["status"] == "success":
+                best_batch = next_batch
+                current = next_batch
+                continue
+            if result["status"] == "oom":
+                failure_batch = next_batch
+                break
+            return {
+                "ok": False,
+                "message": "batch 检测中遇到非显存错误，已中止。",
+                "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+            }
+
+        if failure_batch is not None and trial_index < max_trials:
+            low = best_batch + 1
+            high = failure_batch - 1
+            while low <= high and trial_index < max_trials:
+                mid = (low + high) // 2
+                result = run_candidate(mid)
+                if result["status"] == "success":
+                    best_batch = mid
+                    low = mid + 1
+                elif result["status"] == "oom":
+                    high = mid - 1
+                else:
+                    return {
+                        "ok": False,
+                        "message": "batch 检测中遇到非显存错误，已中止。",
+                        "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+                    }
+
+    if best_batch <= 0:
+        return {
+            "ok": False,
+            "message": "batch 检测失败：batch_size=1 仍触发显存不足或配置错误。",
+            "data": {"trials": trials, "start_batch_size": start_batch, "resolution": str(probe_base_config.get("resolution", ""))},
+        }
+
+    return {
+        "ok": True,
+        "message": f"检测完成：推荐 batch_size={best_batch}",
+        "data": {
+            "recommended_batch_size": int(best_batch),
+            "start_batch_size": int(start_batch),
+            "resolution": str(probe_base_config.get("resolution", "")),
+            "max_trials": int(max_trials),
+            "hard_cap": int(hard_cap),
+            "trials": trials,
+        },
+    }
 
 
 def run_train(toml_path: str,

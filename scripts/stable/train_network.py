@@ -46,6 +46,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class _LocalCounterValue:
+    def __init__(self, initial_value: int):
+        self.value = int(initial_value)
+
+
+def _create_counter_value(initial_value: int, counter_name: str, args: argparse.Namespace):
+    try:
+        return Value("i", int(initial_value))
+    except Exception as exc:
+        logger.warning(
+            "multiprocessing.Value for %s is unavailable (%s); falling back to local counter in main process.",
+            counter_name,
+            exc,
+        )
+        if getattr(args, "max_data_loader_n_workers", 0) != 0:
+            logger.warning(
+                "max_data_loader_n_workers is forced to 0 because local counters are not shared across worker processes."
+            )
+            args.max_data_loader_n_workers = 0
+            if hasattr(args, "persistent_data_loader_workers"):
+                args.persistent_data_loader_workers = False
+        return _LocalCounterValue(initial_value)
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -231,8 +255,8 @@ class NetworkTrainer:
             # use arbitrary dataset class
             train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
 
-        current_epoch = Value("i", 0)
-        current_step = Value("i", 0)
+        current_epoch = _create_counter_value(0, "current_epoch", args)
+        current_step = _create_counter_value(0, "current_step", args)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
         collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
@@ -548,6 +572,10 @@ class NetworkTrainer:
             # +1 is needed because the state is saved before current_step is set from global_step
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             train_state = {"current_epoch": current_epoch.value, "current_step": current_step.value + 1}
+            for key in ("staged_plan_id", "staged_phase_index", "staged_phase_target_max_train_steps"):
+                value = getattr(args, key, None)
+                if value is not None:
+                    train_state[key] = value
             active_training_time_sec = self._get_effective_active_training_time_sec()
             train_state["active_training_time_sec"] = active_training_time_sec
             train_state["tensorboard_walltime_base"] = (
@@ -1340,6 +1368,9 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offset applied to resumed current_epoch before converting to loop start (default: 0)"
         + " / resume時にstateのcurrent_epochへ加算するオフセット（デフォルト: 0）",
     )
+    parser.add_argument("--staged_plan_id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--staged_phase_index", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--staged_phase_target_max_train_steps", type=int, default=None, help=argparse.SUPPRESS)
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
     # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")

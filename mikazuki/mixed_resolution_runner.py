@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import toml
 
@@ -47,13 +47,20 @@ def _clear_dataset_npz_cache_by_config(config: dict, repo_root: Path):
     log.info(f"[staged-resolution] cache reset finished, total npz removed={total_removed}")
 
 
-def _find_latest_state_dir(config: dict, repo_root: Path) -> Optional[Path]:
+def _safe_int(value, default=-1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, Any]]:
     output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
     if not output_dir.exists() or not output_dir.is_dir():
-        return None
+        return []
 
     output_name = str(config.get("output_name", "") or "").strip()
-    candidates = []
+    candidates: list[dict[str, Any]] = []
     for entry in output_dir.glob("*-state"):
         if not entry.is_dir():
             continue
@@ -62,27 +69,89 @@ def _find_latest_state_dir(config: dict, repo_root: Path) -> Optional[Path]:
         state_file = entry / "train_state.json"
         step_num = -1
         epoch_num = -1
+        state_data = {}
         if state_file.exists():
             try:
-                data = json.loads(state_file.read_text(encoding="utf-8"))
-                step_num = int(data.get("current_step", -1))
-                epoch_num = int(data.get("current_epoch", -1))
+                state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                step_num = _safe_int(state_data.get("current_step", -1), -1)
+                epoch_num = _safe_int(state_data.get("current_epoch", -1), -1)
             except Exception:
                 pass
         if step_num < 0 or epoch_num < 0:
             # fallback for legacy folders without readable train_state
             match = re.search(r"-(\d+)-state$", entry.name)
-            epoch_num = int(match.group(1)) if match else -1
+            epoch_num = _safe_int(match.group(1), -1) if match else -1
         try:
             mtime = entry.stat().st_mtime
         except Exception:
             mtime = 0
-        candidates.append((step_num, epoch_num, mtime, entry))
+        plan_id = None
+        if isinstance(state_data, dict):
+            plan_id_raw = str(state_data.get("staged_plan_id", "") or "").strip()
+            plan_id = plan_id_raw if plan_id_raw else None
 
+        candidates.append(
+            {
+                "path": entry,
+                "step_num": int(step_num),
+                "epoch_num": int(epoch_num),
+                "mtime": float(mtime),
+                "plan_id": plan_id,
+            }
+        )
+
+    candidates.sort(key=lambda x: (x["step_num"], x["epoch_num"], x["mtime"]), reverse=True)
+    return candidates
+
+
+def _select_latest_state_candidate(
+    config: dict,
+    repo_root: Path,
+    *,
+    max_step: Optional[int] = None,
+    min_step_exclusive: Optional[int] = None,
+    plan_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    candidates = _collect_state_candidates(config, repo_root)
     if not candidates:
         return None
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    return candidates[0][3]
+
+    def _filter(items, strict_plan: bool):
+        result = []
+        for item in items:
+            step_num = int(item.get("step_num", -1))
+            state_plan_id = item.get("plan_id")
+
+            if step_num < 0:
+                # For robust phase resume matching we need numeric steps.
+                continue
+            if max_step is not None and step_num > int(max_step):
+                continue
+            if min_step_exclusive is not None and step_num <= int(min_step_exclusive):
+                continue
+
+            if plan_id:
+                if strict_plan:
+                    if state_plan_id != plan_id:
+                        continue
+                else:
+                    # Backward compatibility: keep legacy states without plan_id.
+                    if state_plan_id is not None and state_plan_id != plan_id:
+                        continue
+
+            result.append(item)
+        return result
+
+    if plan_id:
+        strict = _filter(candidates, strict_plan=True)
+        if strict:
+            return strict[0]
+
+    relaxed = _filter(candidates, strict_plan=False)
+    if relaxed:
+        return relaxed[0]
+
+    return None
 
 
 def _load_toml(path: Path) -> dict:
@@ -110,6 +179,100 @@ def _build_phase_command(trainer_file: str, toml_file: str, cpu_threads: int, la
     ]
 
 
+def _infer_resume_context(
+    plan: dict,
+    phases: list[dict[str, Any]],
+    first_phase_config: dict,
+    repo_root: Path,
+    *,
+    explicit_resume: bool = False,
+) -> dict[str, Any]:
+    if not phases:
+        return {
+            "start_pos": 0,
+            "completed": False,
+            "resume_state_dir": "",
+            "resume_step": None,
+            "intra_phase_resume": False,
+            "apply_boundary_offset": False,
+        }
+
+    total_target_max_steps = int(phases[-1].get("target_max_train_steps", 0) or 0)
+    plan_id = str(plan.get("plan_id", "") or "").strip() or None
+    latest_state = _select_latest_state_candidate(
+        first_phase_config,
+        repo_root,
+        max_step=total_target_max_steps if total_target_max_steps > 0 else None,
+        min_step_exclusive=None,
+        plan_id=plan_id,
+    )
+    if latest_state is None:
+        return {
+            "start_pos": 0,
+            "completed": False,
+            "resume_state_dir": "",
+            "resume_step": None,
+            "intra_phase_resume": False,
+            "apply_boundary_offset": False,
+        }
+
+    step_num = int(latest_state.get("step_num", -1))
+    state_dir = str(latest_state["path"])
+
+    if step_num < 0:
+        # Cannot map phase robustly without a step, but resume from this state is still safer than full restart.
+        return {
+            "start_pos": 0,
+            "completed": False,
+            "resume_state_dir": state_dir,
+            "resume_step": None,
+            "intra_phase_resume": True,
+            "apply_boundary_offset": False,
+        }
+
+    prev_target = 0
+    start_pos = None
+    for idx, phase in enumerate(phases):
+        target = int(phase.get("target_max_train_steps", 0) or 0)
+        if step_num < target:
+            start_pos = idx
+            break
+        prev_target = target
+
+    if start_pos is None:
+        if not explicit_resume:
+            return {
+                "start_pos": 0,
+                "completed": False,
+                "resume_state_dir": "",
+                "resume_step": step_num,
+                "intra_phase_resume": False,
+                "apply_boundary_offset": False,
+                "ignore_existing_completed_state": True,
+            }
+        return {
+            "start_pos": len(phases),
+            "completed": True,
+            "resume_state_dir": state_dir,
+            "resume_step": step_num,
+            "intra_phase_resume": False,
+            "apply_boundary_offset": False,
+        }
+
+    prev_target_for_start = int(phases[start_pos - 1].get("target_max_train_steps", 0) or 0) if start_pos > 0 else 0
+    intra_phase_resume = step_num > prev_target_for_start
+    apply_boundary_offset = bool(start_pos > 0 and not intra_phase_resume)
+
+    return {
+        "start_pos": int(start_pos),
+        "completed": False,
+        "resume_state_dir": state_dir,
+        "resume_step": int(step_num),
+        "intra_phase_resume": bool(intra_phase_resume),
+        "apply_boundary_offset": bool(apply_boundary_offset),
+    }
+
+
 def _run_mixed_plan(plan: dict) -> int:
     trainer_file = str(plan["trainer_file"])
     cpu_threads = int(plan.get("cpu_threads", 2) or 2)
@@ -121,37 +284,93 @@ def _run_mixed_plan(plan: dict) -> int:
         log.error("[staged-resolution] no phase in plan")
         return 2
 
-    auto_resume_state_dir = ""
-    prev_resolution = None
-
+    phase_tomls = []
     for phase in phases:
-        phase_index = int(phase["phase_index"])
         phase_toml = Path(str(phase["toml_path"])).resolve()
         if not phase_toml.exists():
             log.error(f"[staged-resolution] phase toml not found: {phase_toml}")
             return 2
+        phase_tomls.append(phase_toml)
+
+    first_phase_config = _load_toml(phase_tomls[0])
+    explicit_resume = bool(str(first_phase_config.get("resume", "") or "").strip())
+    resume_ctx = _infer_resume_context(
+        plan,
+        phases,
+        first_phase_config,
+        repo_root,
+        explicit_resume=explicit_resume,
+    )
+    if resume_ctx.get("ignore_existing_completed_state"):
+        log.info(
+            "[staged-resolution] found existing state at/over final target steps, "
+            "but no explicit resume is set. start from phase 1 as a fresh staged run."
+        )
+    start_pos = int(resume_ctx.get("start_pos", 0) or 0)
+    if resume_ctx.get("completed"):
+        log.info(
+            "[staged-resolution] detected existing state reaches or exceeds final target steps. "
+            "all phases are considered completed."
+        )
+        return 0
+
+    auto_resume_state_dir = ""
+    prev_resolution = str(phases[start_pos - 1].get("resolution", "") or "").strip() if start_pos > 0 else None
+    if resume_ctx.get("resume_state_dir"):
+        log.info(
+            f"[staged-resolution] restart detected: start_phase={start_pos + 1}, "
+            f"resume_state={resume_ctx.get('resume_state_dir')}, resume_step={resume_ctx.get('resume_step')}, "
+            f"intra_phase_resume={'yes' if resume_ctx.get('intra_phase_resume') else 'no'}, "
+            f"boundary_offset={'yes' if resume_ctx.get('apply_boundary_offset') else 'no'}"
+        )
+
+    for pos in range(start_pos, len(phases)):
+        phase = phases[pos]
+        phase_index = int(phase["phase_index"])
+        phase_toml = phase_tomls[pos]
 
         phase_config = _load_toml(phase_toml)
         phase_resolution = str(phase.get("resolution", phase_config.get("resolution", "")) or "").strip()
 
-        if phase.get("clear_cache_before_start", False) and prev_resolution is not None and phase_resolution != prev_resolution:
-            log.info(
-                f"[staged-resolution] phase {phase_index}: resolution switched "
-                f"{prev_resolution} -> {phase_resolution}, reset dataset npz cache"
-            )
-            _clear_dataset_npz_cache_by_config(phase_config, repo_root)
+        should_clear_cache = bool(phase.get("clear_cache_before_start", False))
+        if should_clear_cache:
+            if pos == start_pos and resume_ctx.get("intra_phase_resume"):
+                # Same phase retry: keep existing cache to avoid unnecessary rebuild.
+                pass
+            else:
+                prev_resolution_for_switch = prev_resolution
+                if not prev_resolution_for_switch and pos > 0:
+                    prev_resolution_for_switch = str(phases[pos - 1].get("resolution", "") or "").strip()
+                if prev_resolution_for_switch and phase_resolution != prev_resolution_for_switch:
+                    log.info(
+                        f"[staged-resolution] phase {phase_index}: resolution switched "
+                        f"{prev_resolution_for_switch} -> {phase_resolution}, reset dataset npz cache"
+                    )
+                    _clear_dataset_npz_cache_by_config(phase_config, repo_root)
 
-        resume_value = str(phase_config.get("resume", "") or "").strip()
-        if resume_value == MIXED_RESOLUTION_RESUME_SENTINEL:
-            if not auto_resume_state_dir:
-                log.error(
-                    f"[staged-resolution] phase {phase_index}: resume sentinel found but previous phase state is missing"
-                )
-                return 2
-            phase_config["resume"] = auto_resume_state_dir
-            phase_config["resume_epoch_offset"] = 1
+        if pos == start_pos and resume_ctx.get("resume_state_dir"):
+            phase_config["resume"] = str(resume_ctx["resume_state_dir"])
+            if resume_ctx.get("apply_boundary_offset"):
+                phase_config["resume_epoch_offset"] = 1
+            else:
+                phase_config.pop("resume_epoch_offset", None)
             _write_toml(phase_toml, phase_config)
-            log.info(f"[staged-resolution] phase {phase_index}: auto resume from {auto_resume_state_dir}")
+            log.info(
+                f"[staged-resolution] phase {phase_index}: restart resume from "
+                f"{resume_ctx.get('resume_state_dir')} (resume_epoch_offset={phase_config.get('resume_epoch_offset', 0)})"
+            )
+        else:
+            resume_value = str(phase_config.get("resume", "") or "").strip()
+            if resume_value == MIXED_RESOLUTION_RESUME_SENTINEL:
+                if not auto_resume_state_dir:
+                    log.error(
+                        f"[staged-resolution] phase {phase_index}: resume sentinel found but previous phase state is missing"
+                    )
+                    return 2
+                phase_config["resume"] = auto_resume_state_dir
+                phase_config["resume_epoch_offset"] = 1
+                _write_toml(phase_toml, phase_config)
+                log.info(f"[staged-resolution] phase {phase_index}: auto resume from {auto_resume_state_dir}")
 
         log.info(
             f"[staged-resolution] phase {phase_index}/{len(phases)} start: "
@@ -175,24 +394,33 @@ def _run_mixed_plan(plan: dict) -> int:
             return return_code
 
         prev_resolution = phase_resolution
-        is_last_phase = phase_index >= len(phases)
+        is_last_phase = pos >= len(phases) - 1
         if is_last_phase:
             log.info(f"[staged-resolution] phase {phase_index} finished (last phase)")
             continue
 
         phase_config_after = _load_toml(phase_toml)
-        latest_state_dir = _find_latest_state_dir(phase_config_after, repo_root)
-        if latest_state_dir is None:
+        phase_target_max_steps = int(phase.get("target_max_train_steps", 0) or 0)
+        prev_phase_target_max_steps = int(phases[pos - 1].get("target_max_train_steps", 0) or 0) if pos > 0 else 0
+        latest_state = _select_latest_state_candidate(
+            phase_config_after,
+            repo_root,
+            max_step=phase_target_max_steps if phase_target_max_steps > 0 else None,
+            min_step_exclusive=prev_phase_target_max_steps if prev_phase_target_max_steps > 0 else 0,
+            plan_id=str(plan.get("plan_id", "") or "").strip() or None,
+        )
+        if latest_state is None:
             log.error(
                 "[staged-resolution] cannot find latest state after phase "
                 f"{phase_index}. 请确认 save_state 已启用并且 save_every_n_epochs 配置正确。"
             )
             return 2
 
-        auto_resume_state_dir = str(latest_state_dir)
+        auto_resume_state_dir = str(latest_state["path"])
         log.info(
             f"[staged-resolution] phase {phase_index} finished, "
-            f"resume state={auto_resume_state_dir}, next phase will apply resume_epoch_offset=1"
+            f"resume state={auto_resume_state_dir}, resume_step={latest_state.get('step_num')}, "
+            "next phase will apply resume_epoch_offset=1"
         )
 
     log.info("[staged-resolution] all phases finished")

@@ -1137,6 +1137,409 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 })();
 </script>
 """
+
+_CTRL_S_SAVE_CONFIG_INJECTION = """
+<script id="mikazuki-ctrls-save-config">
+(function () {
+  if (window.__MIKAZUKI_CTRL_S_SAVE_CONFIG__) return;
+  window.__MIKAZUKI_CTRL_S_SAVE_CONFIG__ = true;
+
+  var SAVE_LABEL_RE = /^(保存参数|保存配置|save\\s*params?|save\\s*config)$/i;
+
+  function getSchemaForm() {
+    return (
+      document.querySelector(".k-form") ||
+      document.querySelector(".schema-container form") ||
+      document.querySelector("form")
+    );
+  }
+
+  function normalizeText(text) {
+    return String(text || "").replace(/\\s+/g, " ").trim();
+  }
+
+  function isElementDisabled(el) {
+    if (!el) return true;
+    if (el.disabled) return true;
+    var ariaDisabled = String(el.getAttribute("aria-disabled") || el.getAttribute("ariadisabled") || "").toLowerCase();
+    return ariaDisabled === "true" || ariaDisabled === "1";
+  }
+
+  function findSaveConfigButton() {
+    var root =
+      document.querySelector(".example-container") ||
+      document.querySelector("#app") ||
+      document.body ||
+      document.documentElement;
+    if (!root) return null;
+
+    var buttons = root.querySelectorAll("button, [role='button']");
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      if (!btn || isElementDisabled(btn)) continue;
+      var label = normalizeText(btn.textContent || btn.innerText || "");
+      if (!label) continue;
+      if (SAVE_LABEL_RE.test(label)) return btn;
+    }
+    return null;
+  }
+
+  function isSaveHotkey(event) {
+    if (!event) return false;
+    if (event.isComposing) return false;
+    if (event.altKey) return false;
+    if (!(event.ctrlKey || event.metaKey)) return false;
+    var key = String(event.key || "").toLowerCase();
+    return key === "s" || event.code === "KeyS";
+  }
+
+  function onKeydown(event) {
+    if (!isSaveHotkey(event)) return;
+
+    var btn = findSaveConfigButton();
+    if (!btn) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    btn.click();
+  }
+
+  window.addEventListener("keydown", onKeydown, true);
+})();
+</script>
+"""
+
+_BATCH_SIZE_PROBE_INJECTION = """
+<style id="mikazuki-batch-probe-style">
+#mikazuki-batch-probe-wrap {
+  margin: 6px 0 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#mikazuki-batch-probe-btn {
+  width: fit-content;
+  min-width: 180px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid #7ea7db;
+  border-radius: 6px;
+  background: #edf4ff;
+  color: #15437a;
+  cursor: pointer;
+}
+#mikazuki-batch-probe-btn[disabled] {
+  opacity: 0.7;
+  cursor: wait;
+}
+#mikazuki-batch-probe-status {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #606266;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#mikazuki-batch-probe-status.error {
+  color: #c45656;
+}
+</style>
+<script id="mikazuki-batch-probe">
+(function () {
+  if (window.__MIKAZUKI_BATCH_PROBE__) return;
+  window.__MIKAZUKI_BATCH_PROBE__ = true;
+
+  var state = {
+    running: false,
+    scheduled: false
+  };
+
+  function getSchemaForm() {
+    return (
+      document.querySelector(".k-form") ||
+      document.querySelector(".schema-container form") ||
+      document.querySelector("form")
+    );
+  }
+
+  function getSchemaItems() {
+    var form = getSchemaForm();
+    if (!form) return [];
+    return form.querySelectorAll(".k-schema-item");
+  }
+
+  function getItemSearchText(item, title) {
+    var titleText = (title && title.textContent ? title.textContent : "").trim();
+    var itemText = (item && item.textContent ? item.textContent : "").trim();
+    return (titleText + " " + itemText).toLowerCase();
+  }
+
+  function findSchemaField(patterns) {
+    var items = getSchemaItems();
+    if (!patterns || patterns.length === 0) return null;
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var title = item.querySelector("h3");
+      var searchText = getItemSearchText(item, title);
+      for (var j = 0; j < patterns.length; j++) {
+        if (patterns[j].test(searchText)) {
+          return { item: item, title: title, searchText: searchText };
+        }
+      }
+    }
+    return null;
+  }
+
+  function findValueElement(item, preferCheckbox) {
+    if (!item) return null;
+    if (preferCheckbox) {
+      var cb = item.querySelector("input[type='checkbox']");
+      if (cb) return cb;
+    }
+
+    var select = item.querySelector("select");
+    if (select) return select;
+
+    var textarea = item.querySelector("textarea");
+    if (textarea) return textarea;
+
+    var inputs = item.querySelectorAll("input");
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      var type = String(input.getAttribute("type") || "").toLowerCase();
+      if (type === "hidden") continue;
+      if (type === "checkbox" && !preferCheckbox) continue;
+      if (type === "radio" && !input.checked) continue;
+      return input;
+    }
+    return null;
+  }
+
+  function dispatchInput(input) {
+    if (!input) return;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function parseMaybeNumber(raw) {
+    var text = String(raw == null ? "" : raw).trim();
+    if (text === "") return "";
+    if (!/^-?\\d+(\\.\\d+)?$/.test(text)) return text;
+    var n = Number(text);
+    return Number.isFinite(n) ? n : text;
+  }
+
+  function readFieldValue(item) {
+    if (!item) return undefined;
+    var checkbox = findValueElement(item, true);
+    if (checkbox && String(checkbox.getAttribute("type") || "").toLowerCase() === "checkbox") {
+      return !!checkbox.checked;
+    }
+
+    var el = findValueElement(item, false);
+    if (!el) return undefined;
+    var tag = String(el.tagName || "").toLowerCase();
+    if (tag === "select" || tag === "textarea") {
+      var textValue = String(el.value || "").trim();
+      return textValue;
+    }
+
+    var type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "number" || type === "range") {
+      return parseMaybeNumber(el.value);
+    }
+    if (type === "checkbox") return !!el.checked;
+    return parseMaybeNumber(el.value);
+  }
+
+  function writeNumberField(item, value) {
+    var el = findValueElement(item, false);
+    if (!el) return false;
+    var next = String(value);
+    if (String(el.value || "").trim() === next) return false;
+    el.value = next;
+    dispatchInput(el);
+    return true;
+  }
+
+  function setStatus(statusEl, message, isError) {
+    if (!statusEl) return;
+    statusEl.textContent = String(message == null ? "" : message);
+    if (isError) statusEl.classList.add("error");
+    else statusEl.classList.remove("error");
+  }
+
+  function summarizeTrials(trials) {
+    if (!Array.isArray(trials) || trials.length === 0) return "";
+    var parts = [];
+    for (var i = 0; i < trials.length; i++) {
+      var t = trials[i] || {};
+      parts.push(String(t.batch_size) + ":" + String(t.status || "unknown"));
+    }
+    return parts.join(", ");
+  }
+
+  function setIfFound(config, key, patterns) {
+    var field = findSchemaField(patterns);
+    if (!field) return;
+    var value = readFieldValue(field.item);
+    if (value === undefined || value === null) return;
+    if (typeof value === "string" && value.trim() === "") return;
+    config[key] = value;
+  }
+
+  function collectProbeConfig() {
+    var cfg = {};
+    setIfFound(cfg, "model_train_type", [/model_train_type/i, /训练种类/, /train type/]);
+    setIfFound(cfg, "pretrained_model_name_or_path", [/pretrained_model_name_or_path/i, /底模文件路径/]);
+    setIfFound(cfg, "train_data_dir", [/train_data_dir/i, /训练数据集路径/]);
+    setIfFound(cfg, "reg_data_dir", [/reg_data_dir/i, /正则化数据集路径/]);
+    setIfFound(cfg, "resolution", [/(^|[^a-z])resolution([^a-z]|$)/i, /训练图片分辨率/, /训练分辨率/]);
+
+    setIfFound(cfg, "train_batch_size", [/train_batch_size/i, /批量大小/]);
+    setIfFound(cfg, "gradient_checkpointing", [/gradient_checkpointing/i, /梯度检查点/]);
+    setIfFound(cfg, "gradient_accumulation_steps", [/gradient_accumulation_steps/i, /梯度累加/, /梯度累积/]);
+
+    setIfFound(cfg, "enable_bucket", [/enable_bucket/i, /arb.*桶/, /启用 arb/]);
+    setIfFound(cfg, "min_bucket_reso", [/min_bucket_reso/i, /桶最小分辨率/]);
+    setIfFound(cfg, "max_bucket_reso", [/max_bucket_reso/i, /桶最大分辨率/]);
+    setIfFound(cfg, "bucket_reso_steps", [/bucket_reso_steps/i, /桶分辨率划分单位/]);
+    setIfFound(cfg, "bucket_no_upscale", [/bucket_no_upscale/i, /桶不放大图片/]);
+
+    setIfFound(cfg, "network_module", [/network_module/i, /训练网络模块/]);
+    setIfFound(cfg, "network_dim", [/network_dim/i, /网络维度/]);
+    setIfFound(cfg, "network_alpha", [/network_alpha/i, /网络alpha/]);
+    setIfFound(cfg, "network_dropout", [/network_dropout/i, /dropout/]);
+    setIfFound(cfg, "network_train_unet_only", [/network_train_unet_only/i, /仅训练\\s*u-?net/]);
+    setIfFound(cfg, "network_train_text_encoder_only", [/network_train_text_encoder_only/i, /仅训练文本编码器/]);
+
+    setIfFound(cfg, "optimizer_type", [/optimizer_type/i, /优化器/]);
+    setIfFound(cfg, "learning_rate", [/learning_rate/i, /总学习率/]);
+    setIfFound(cfg, "unet_lr", [/unet_lr/i, /u-?net\\s*学习率/]);
+    setIfFound(cfg, "text_encoder_lr", [/text_encoder_lr/i, /文本编码器学习率/]);
+
+    setIfFound(cfg, "mixed_precision", [/mixed_precision/i, /混合精度/]);
+    setIfFound(cfg, "full_fp16", [/full_fp16/i, /完全使用\\s*fp16/]);
+    setIfFound(cfg, "full_bf16", [/full_bf16/i, /完全使用\\s*bf16/]);
+    setIfFound(cfg, "xformers", [/xformers/i]);
+    setIfFound(cfg, "sdpa", [/sdpa/i]);
+    setIfFound(cfg, "lowram", [/lowram/i, /低内存模式/]);
+    setIfFound(cfg, "cache_latents", [/cache_latents([^_]|$)/i, /缓存图像\\s*latent/]);
+    setIfFound(cfg, "cache_latents_to_disk", [/cache_latents_to_disk/i, /缓存图像\\s*latent\\s*到磁盘/]);
+    setIfFound(cfg, "cache_text_encoder_outputs", [/cache_text_encoder_outputs([^_]|$)/i, /缓存文本编码器的输出/]);
+    setIfFound(cfg, "cache_text_encoder_outputs_to_disk", [/cache_text_encoder_outputs_to_disk/i, /缓存文本编码器的输出到磁盘/]);
+    setIfFound(cfg, "persistent_data_loader_workers", [/persistent_data_loader_workers/i, /保留加载训练集的worker/]);
+    setIfFound(cfg, "vae", [/^vae\\b/i, /vae 模型文件路径/]);
+    setIfFound(cfg, "no_half_vae", [/no_half_vae/i, /不使用半精度\\s*vae/]);
+
+    if (!cfg.model_train_type || String(cfg.model_train_type).trim() === "") {
+      cfg.model_train_type = "sdxl-lora";
+    }
+    return cfg;
+  }
+
+  function ensureProbeBlock(batchField, gradField) {
+    if (!batchField || !batchField.item || !batchField.item.parentNode) return null;
+    var form = getSchemaForm();
+    if (!form) return null;
+
+    var wrap = form.querySelector("#mikazuki-batch-probe-wrap");
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.id = "mikazuki-batch-probe-wrap";
+      wrap.innerHTML =
+        '<button id="mikazuki-batch-probe-btn" type="button">一键检测 Batch Size</button>' +
+        '<div id="mikazuki-batch-probe-status">点击后将按当前分辨率和当前训练配置进行短跑探测。</div>';
+    }
+
+    if (gradField && gradField.item && gradField.item.parentNode === batchField.item.parentNode) {
+      if (gradField.item.previousSibling !== wrap) {
+        gradField.item.parentNode.insertBefore(wrap, gradField.item);
+      }
+    } else if (batchField.item.nextSibling !== wrap) {
+      batchField.item.parentNode.insertBefore(wrap, batchField.item.nextSibling);
+    }
+
+    return {
+      wrap: wrap,
+      button: wrap.querySelector("#mikazuki-batch-probe-btn"),
+      status: wrap.querySelector("#mikazuki-batch-probe-status")
+    };
+  }
+
+  async function triggerProbe(button, statusEl) {
+    if (!button || state.running) return;
+    var cfg = collectProbeConfig();
+
+    if (!cfg.pretrained_model_name_or_path || !cfg.train_data_dir || !cfg.resolution) {
+      setStatus(statusEl, "检测失败：请先填写底模路径、训练数据集路径、训练分辨率。", true);
+      return;
+    }
+
+    state.running = true;
+    button.disabled = true;
+    setStatus(statusEl, "正在检测，请稍候（会进行真实短训练探测）...", false);
+    try {
+      var resp = await fetch("/api/probe_batch_size", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg)
+      });
+      var payload = await resp.json();
+      if (!payload || payload.status !== "success") {
+        setStatus(statusEl, "检测失败：" + String(payload && payload.message ? payload.message : "未知错误"), true);
+        return;
+      }
+
+      var data = payload.data || {};
+      var recommended = Number(data.recommended_batch_size || 0);
+      if (recommended > 0) {
+        var currentBatchField = findSchemaField([/train_batch_size/i, /批量大小/]);
+        if (currentBatchField && currentBatchField.item) {
+          writeNumberField(currentBatchField.item, recommended);
+        }
+      }
+      var summary = summarizeTrials(data.trials);
+      var msg = "检测完成，推荐 batch_size=" + recommended + (summary ? ("；测试记录: " + summary) : "");
+      setStatus(statusEl, msg, false);
+    } catch (e) {
+      setStatus(statusEl, "检测失败：网络异常或后端不可用。", true);
+    } finally {
+      state.running = false;
+      button.disabled = false;
+    }
+  }
+
+  function update() {
+    var batchField = findSchemaField([/train_batch_size/i, /批量大小/]);
+    if (!batchField) return;
+    var gradField = findSchemaField([/gradient_checkpointing/i, /梯度检查点/]);
+    var block = ensureProbeBlock(batchField, gradField);
+    if (!block || !block.button) return;
+
+    if (!block.button.__mikazukiBound) {
+      block.button.__mikazukiBound = true;
+      block.button.addEventListener("click", function () {
+        triggerProbe(block.button, block.status);
+      });
+    }
+  }
+
+  function scheduleUpdate() {
+    if (state.scheduled) return;
+    state.scheduled = true;
+    setTimeout(function () {
+      state.scheduled = false;
+      update();
+    }, 60);
+  }
+
+  var observer = new MutationObserver(function () { scheduleUpdate(); });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("load", function () { scheduleUpdate(); });
+  setInterval(scheduleUpdate, 1000);
+})();
+</script>
+"""
 _patched_frontend_html_cache: dict[str, tuple[int, str]] = {}
 
 
@@ -1198,6 +1601,34 @@ def _inject_tensorboard_runs_default(html_content: str) -> str:
     return _TENSORBOARD_RUNS_DEFAULT_INJECTION + "\n" + html_content
 
 
+def _inject_ctrl_s_save_config(html_content: str) -> str:
+    if 'id="mikazuki-ctrls-save-config"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _CTRL_S_SAVE_CONFIG_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _CTRL_S_SAVE_CONFIG_INJECTION + "\n</head>", 1)
+
+    return _CTRL_S_SAVE_CONFIG_INJECTION + "\n" + html_content
+
+
+def _inject_batch_size_probe(html_content: str) -> str:
+    if 'id="mikazuki-batch-probe"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _BATCH_SIZE_PROBE_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _BATCH_SIZE_PROBE_INJECTION + "\n</head>", 1)
+
+    return _BATCH_SIZE_PROBE_INJECTION + "\n" + html_content
+
+
 def _resolve_frontend_html_file(request_path: str) -> Path | None:
     if not FRONTEND_STATIC_DIR:
         return None
@@ -1247,6 +1678,8 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
     content = _inject_schema_bootstrap(content)
     content = _inject_hide_deprecated_lora_docs(content)
     content = _inject_tensorboard_runs_default(content)
+    content = _inject_ctrl_s_save_config(content)
+    content = _inject_batch_size_probe(content)
     content = _inject_worker_mode_guard(content)
     content = _inject_staged_resolution_preview(content)
     _patched_frontend_html_cache[cache_key] = (mtime_ns, content)
