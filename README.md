@@ -4,6 +4,51 @@ LoRA-scripts (a.k.a SD-Trainer)
 
 LoRA & Dreambooth training GUI & scripts preset & one-key training environment for [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts.git).
 
+## Recent Updates / 更新说明
+
+### 1) Resume 流程修复（可从中断步数继续）
+
+- Resume now restores model/optimizer/scheduler/dataloader/random states from `*-state` folders correctly.
+- To continue from an interrupted run (for example continue from `6/1800`), set `resume` to a state directory like:
+  - `./output/<your_output_name>/<your_output_name>-000070-state`
+- The state directory must contain `train_state.json`.
+- `network_weights` only loads LoRA weights and starts a new schedule. It is not equal to full state resume.
+
+Recommended resume usage:
+
+1. Keep `train_data_dir`, `resolution`, `train_batch_size`, and `gradient_accumulation_steps` the same as the original run.
+2. Set `resume` to the desired `*-state` directory.
+3. Start training; progress should continue from recorded step/epoch.
+
+### 2) 阶段分辨率训练（Staged Resolution Training）
+
+- Added staged resolution training mode (512 -> 768 -> 1024).
+- Base training resolution is fixed to `1024,1024` in this mode.
+- The trainer auto-calculates phase batch size and equivalent epochs from the 1024-base setting.
+- Target is equivalent pixel-level training budget (total compute budget stays close), while often improving detail consolidation.
+- Phase ratios are configurable (0% to 100% each, sum <= 100%).
+
+Core formula:
+
+- `phase_batch = floor(base_batch * (1024*1024)/(phase_res*phase_res))`
+- `raw_phase_epoch = ceil(base_epoch * phase_ratio * (phase_batch/base_batch))`
+- `actual_phase_epoch = ceil_to_multiple(raw_phase_epoch, phase_save/sample alignment rule)`
+
+### 3) TensorBoard 记录优化
+
+- Run naming is improved for readability: `YYYY-MM-DD + model + _n`.
+- Resume training merges into the same TensorBoard run.
+- Runs that produce no checkpoint are removed from records.
+- Logging continuity is improved for resumed training scenarios.
+
+### 4) Torch 2.10 + Blackwell 显卡建议
+
+- For Torch 2.10 on Blackwell GPUs, this repo prefers SDPA path and avoids xformers path.
+- This reduces VRAM usage and improves stability on new architecture cards.
+- Verified practical batch size guidance on RTX 5090:
+  - Linux: up to batch size `24` (typical)
+  - Windows: recommend `22` for stability margin
+
 
 ## Usage
 
