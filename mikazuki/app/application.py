@@ -1506,14 +1506,37 @@ _BATCH_SIZE_PROBE_INJECTION = """
 
       var data = payload.data || {};
       var recommended = Number(data.recommended_batch_size || 0);
+      var maxStable = Number(data.max_stable_batch_size || 0);
+      var sharedMemHits = Number(data.shared_memory_hit_count || 0);
+      var hasSharedMemHits = !!data.has_shared_memory_hits;
       if (recommended > 0) {
         var currentBatchField = findSchemaField([/train_batch_size/i, /批量大小/]);
         if (currentBatchField && currentBatchField.item) {
           writeNumberField(currentBatchField.item, recommended);
         }
       }
+      var est = data.estimated_range || {};
+      var estLow = Number(est.low || 0);
+      var estHigh = Number(est.high || 0);
+      var mem = data.gpu_memory || {};
+      var memTotal = Number(mem.total_mib || 0);
       var summary = summarizeTrials(data.trials);
-      var msg = "检测完成，推荐 batch_size=" + recommended + (summary ? ("；测试记录: " + summary) : "");
+      var msg = "检测完成，推荐 batch_size=" + recommended;
+      if (maxStable > 0) {
+        msg += "（最大稳定值=" + maxStable + "，已预留安全余量）";
+      }
+      if (estLow > 0 && estHigh > 0) {
+        msg += "；显存预估范围: " + estLow + "~" + estHigh;
+      }
+      if (memTotal > 0) {
+        msg += "；GPU总显存: " + memTotal + "MiB";
+      }
+      if (hasSharedMemHits || sharedMemHits > 0) {
+        msg += "；进程级共享显存命中: " + sharedMemHits + " 次（仅在独显接近满载时触发降档）";
+      }
+      if (summary) {
+        msg += "；测试记录: " + summary;
+      }
       setStatus(statusEl, msg, false);
     } catch (e) {
       setStatus(statusEl, "检测失败：网络异常或后端不可用。", true);
