@@ -57,6 +57,8 @@ DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
 MESH_NET_MONITOR_INTERVAL_SECONDS = 10
 CKPT_EXTENSIONS = {".safetensors", ".ckpt", ".pt"}
 TB_EVENT_FILE_GLOB = "events.out.tfevents.*"
+STATE_REQUIRED_FILES = ("train_state.json", "optimizer.bin", "scheduler.bin")
+STATE_MODEL_FILE_CANDIDATES = ("model.safetensors", "pytorch_model.bin", "model.bin")
 MIXED_RESOLUTION_ENABLE_KEY = "enable_mixed_resolution_training"
 MIXED_RESOLUTION_PHASE_SIDES = (512, 768, 1024)
 MIXED_RESOLUTION_RATIO_CONFIG_KEYS = {
@@ -1134,6 +1136,22 @@ def _list_existing_training_artifacts_for_run(config: dict, repo_root: Path) -> 
     return sorted(artifacts.values(), key=lambda p: p.name)
 
 
+def _check_resume_state_dir_complete(state_dir: Path) -> Tuple[bool, str]:
+    for name in STATE_REQUIRED_FILES:
+        if not (state_dir / name).is_file():
+            return False, f"missing {name}"
+
+    has_model_file = any((state_dir / name).is_file() for name in STATE_MODEL_FILE_CANDIDATES)
+    if not has_model_file:
+        has_model_file = any(state_dir.glob("pytorch_model*.bin"))
+    if not has_model_file:
+        has_model_file = any(state_dir.glob("model*.safetensors"))
+    if not has_model_file:
+        return False, "missing model state file"
+
+    return True, ""
+
+
 def _validate_resume_launch_guard(config: dict, repo_root: Path) -> Tuple[bool, str]:
     artifacts = _list_existing_training_artifacts_for_run(config, repo_root)
     if not artifacts:
@@ -1165,6 +1183,15 @@ def _validate_resume_launch_guard(config: dict, repo_root: Path) -> Tuple[bool, 
             False,
             "resume 路径不是有效的 state 目录（缺少 train_state.json），已阻止启动。"
             f" resume={resume_dir}"
+        )
+
+    complete, incomplete_reason = _check_resume_state_dir_complete(resume_dir)
+    if not complete:
+        return (
+            False,
+            "resume 路径指向的 state 目录不完整，已阻止启动。"
+            f" resume={resume_dir}，原因: {incomplete_reason}。"
+            "请先确保从主机同步完整 state（model/optimizer/scheduler）后再重试。"
         )
 
     try:

@@ -14,6 +14,8 @@ from mikazuki.log import log
 
 MIXED_RESOLUTION_RESUME_SENTINEL = "__MIXED_AUTO_RESUME__"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
+STATE_REQUIRED_FILES = ("train_state.json", "optimizer.bin", "scheduler.bin")
+STATE_MODEL_FILE_CANDIDATES = ("model.safetensors", "pytorch_model.bin", "model.bin")
 
 
 def _resolve_local_path(path_value: str, repo_root: Path) -> Path:
@@ -54,6 +56,22 @@ def _safe_int(value, default=-1) -> int:
         return default
 
 
+def _check_state_dir_complete(state_dir: Path) -> tuple[bool, str]:
+    for name in STATE_REQUIRED_FILES:
+        if not (state_dir / name).is_file():
+            return False, f"missing {name}"
+
+    has_model_file = any((state_dir / name).is_file() for name in STATE_MODEL_FILE_CANDIDATES)
+    if not has_model_file:
+        has_model_file = bool(list(state_dir.glob("pytorch_model*.bin")))
+    if not has_model_file:
+        has_model_file = bool(list(state_dir.glob("model*.safetensors")))
+    if not has_model_file:
+        return False, "missing model state file"
+
+    return True, ""
+
+
 def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, Any]]:
     output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
     if not output_dir.exists() or not output_dir.is_dir():
@@ -65,6 +83,10 @@ def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, A
         if not entry.is_dir():
             continue
         if output_name and not entry.name.startswith(f"{output_name}-"):
+            continue
+        complete, incomplete_reason = _check_state_dir_complete(entry)
+        if not complete:
+            log.warning(f"[staged-resolution] skip incomplete state dir: {entry} ({incomplete_reason})")
             continue
         state_file = entry / "train_state.json"
         step_num = -1

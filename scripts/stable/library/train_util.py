@@ -21,6 +21,7 @@ from typing import (
     Union,
 )
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
+from accelerate.utils import ProjectConfiguration
 import glob
 import math
 import os
@@ -4953,11 +4954,28 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
+    world_size = 1
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    except Exception:
+        world_size = 1
+    save_on_each_node = world_size > 1
+    project_config = ProjectConfiguration(
+        project_dir=logging_dir,
+        logging_dir=logging_dir,
+        save_on_each_node=save_on_each_node,
+    )
+    if save_on_each_node:
+        logger.info(
+            "distributed launch detected (WORLD_SIZE=%s), enable save_on_each_node to keep per-node state complete",
+            world_size,
+        )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=log_with,
-        project_dir=logging_dir,
+        project_config=project_config,
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
         deepspeed_plugin=deepspeed_plugin,
