@@ -45,6 +45,7 @@ WORKER_SYNC_CONFIG_FALLBACK_WHEN_MAIN_MISSING = {
     "lr_scheduler_num_cycles": 1,
 }
 WORKER_SYNC_CONFIG_CLEAR_WHEN_MAIN_MISSING = ("clip_skip",)
+WORKER_REQUIRED_SYNC_ASSET_KEYS = ("resume",)
 MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
@@ -1575,7 +1576,8 @@ def _sync_missing_assets_from_main(
             continue
 
         local_path = _resolve_local_path(value, local_repo_root)
-        if local_path.exists():
+        force_refresh_if_exists = str(key).strip().lower() == "resume"
+        if local_path.exists() and not force_refresh_if_exists:
             log.info(f"[sync-assets] local exists, skip copy: {key} -> {local_path}")
             continue
 
@@ -1592,7 +1594,10 @@ def _sync_missing_assets_from_main(
         if path_type == "error":
             return False, f"无法探测主机路径类型: {key} -> {remote_path}"
 
-        log.info(f"[sync-assets] local missing, start sync: {key} -> {local_path}")
+        if local_path.exists() and force_refresh_if_exists:
+            log.info(f"[sync-assets] local exists, force refresh from main: {key} -> {local_path}")
+        else:
+            log.info(f"[sync-assets] local missing, start sync: {key} -> {local_path}")
         if not _copy_remote_path(
             remote_host,
             ssh_port,
@@ -3072,6 +3077,14 @@ def run_train(toml_path: str,
     is_worker = num_machines > 1 and machine_rank > 0
     remote_host = ""
     if is_worker:
+        seen_asset_keys = {str(k).strip().lower() for k in sync_asset_keys}
+        for required_asset_key in WORKER_REQUIRED_SYNC_ASSET_KEYS:
+            if required_asset_key.lower() in seen_asset_keys:
+                continue
+            sync_asset_keys.append(required_asset_key)
+            seen_asset_keys.add(required_asset_key.lower())
+            log.info(f"[sync-assets] append required key for worker resume consistency: {required_asset_key}")
+
         remote_host = f"{sync_ssh_user}@{main_process_ip}" if sync_ssh_user else str(main_process_ip)
         if sync_use_password_auth and not sync_ssh_password:
             return APIResponse(
