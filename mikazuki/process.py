@@ -33,7 +33,18 @@ LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
 )
 DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
-WORKER_REQUIRED_SYNC_CONFIG_KEYS = ("model_train_type",)
+WORKER_REQUIRED_SYNC_CONFIG_KEYS = (
+    "model_train_type",
+    "v2",
+    "lr_scheduler_num_cycles",
+    "clip_skip",
+)
+WORKER_SYNC_CONFIG_FALLBACK_WHEN_MAIN_MISSING = {
+    # Keep worker behavior deterministic when main toml omits optional keys.
+    "v2": False,
+    "lr_scheduler_num_cycles": 1,
+}
+WORKER_SYNC_CONFIG_CLEAR_WHEN_MAIN_MISSING = ("clip_skip",)
 MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
@@ -1507,6 +1518,22 @@ def _sync_config_from_main(
         else:
             log.info(f"[sync-config] {key}: unchanged ({new_val})")
 
+    for key, fallback in WORKER_SYNC_CONFIG_FALLBACK_WHEN_MAIN_MISSING.items():
+        if key in main_config or key not in local_config:
+            continue
+        old_val = local_config.get(key)
+        if old_val != fallback:
+            local_config[key] = fallback
+            changed += 1
+            log.info(f"[sync-config] {key}: main missing, fallback applied {old_val} -> {fallback}")
+
+    for key in WORKER_SYNC_CONFIG_CLEAR_WHEN_MAIN_MISSING:
+        if key in main_config or key not in local_config:
+            continue
+        old_val = local_config.pop(key)
+        changed += 1
+        log.info(f"[sync-config] {key}: main missing, cleared stale local value ({old_val})")
+
     if changed > 0:
         with open(toml_path, "w", encoding="utf-8") as f:
             f.write(toml.dumps(local_config))
@@ -2945,6 +2972,7 @@ def run_train(toml_path: str,
     customize_env["ACCELERATE_DISABLE_RICH"] = "1"
     customize_env["PYTHONUNBUFFERED"] = "1"
     customize_env["PYTHONWARNINGS"] = "ignore::FutureWarning,ignore::UserWarning"
+    customize_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     distributed_config = distributed_config or {}
     sync_from_main_settings = distributed_config.get("sync_from_main_settings")
