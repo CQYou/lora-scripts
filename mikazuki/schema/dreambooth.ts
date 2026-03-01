@@ -1,29 +1,13 @@
 Schema.intersect([
     Schema.intersect([
         Schema.object({
-            model_train_type: Schema.union(["sd-dreambooth", "sdxl-finetune"]).default("sd-dreambooth").description("训练种类"),
+            model_train_type: Schema.union(["sdxl-finetune"]).default("sdxl-finetune").description("训练种类"),
             pretrained_model_name_or_path: Schema.string().role("filepicker", { type: "model-file" }).default("./sd-models/model.safetensors").description("底模文件路径"),
             resume: Schema.string().role("filepicker", { type: "folder" }).description("从某个 `save_state` 保存的中断状态继续训练，填写文件路径"),
             vae: Schema.string().role("filepicker", { type: "model-file" }).description("(可选) VAE 模型文件路径，使用外置 VAE 文件覆盖模型内本身的"),
         }).description("训练用模型"),
 
-        Schema.union([
-            Schema.object({
-                model_train_type: Schema.const("sd-dreambooth"),
-                v2: Schema.boolean().default(false).description("底模为 sd2.0 以后的版本需要启用"),
-            }),
-            Schema.object({}),
-        ]),
-
-        Schema.union([
-            Schema.object({
-                model_train_type: Schema.const("sd-dreambooth"),
-                v2: Schema.const(true).required(),
-                v_parameterization: Schema.boolean().default(false).description("v-parameterization 学习"),
-                scale_v_pred_loss_like_noise_pred: Schema.boolean().default(false).description("缩放 v-prediction 损失（与v-parameterization配合使用）"),
-            }),
-            Schema.object({}),
-        ]),
+        Schema.object({}),
     ]),
 
     Schema.object({
@@ -49,7 +33,7 @@ Schema.intersect([
     Schema.object({
         max_train_epochs: Schema.number().min(1).default(10).description("最大训练 epoch（轮数）"),
         train_batch_size: Schema.number().min(1).default(1).description("批量大小"),
-        stop_text_encoder_training: Schema.number().min(-1).description("仅 sd-dreambooth 可用。在第 N 步时，停止训练文本编码器。设置为 -1 不训练文本编码器"),
+        stop_text_encoder_training: Schema.number().min(-1).description("在第 N 步停止训练文本编码器。设置为 -1 不训练文本编码器"),
         gradient_checkpointing: Schema.boolean().default(false).description("梯度检查点"),
         gradient_accumulation_steps: Schema.number().min(1).description("梯度累加步数"),
     }).description("训练相关参数"),
@@ -59,14 +43,6 @@ Schema.intersect([
         Schema.object({
             learning_rate: Schema.string().default("1e-6").description("学习率"),
         }).description("学习率与优化器设置"),
-
-        Schema.union([
-            Schema.object({
-                model_train_type: Schema.const("sd-dreambooth"),
-                learning_rate_te: Schema.string().default("5e-7").description("文本编码器学习率"),
-            }),
-            Schema.object({}),
-        ]),
 
         Schema.union([
             Schema.object({
@@ -187,7 +163,7 @@ Schema.intersect([
     Schema.object({
         seed: Schema.number().default(1337).description("随机种子"),
         clip_skip: Schema.number().role("slider").min(0).max(12).step(1).default(2).description("CLIP 跳过层数 *玄学*"),
-        no_token_padding: Schema.boolean().default(false).description("禁用 token 填充（与 Diffusers 的旧 Dreambooth 脚本一致）"),
+        no_token_padding: Schema.boolean().default(false).description("禁用 token 填充"),
     }).description("高级设置"),
 
     Schema.object({

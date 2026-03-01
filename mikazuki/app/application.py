@@ -1111,9 +1111,9 @@ _HIDE_DEPRECATED_LORA_DOCS_INJECTION = """
   if (window.__MIKAZUKI_HIDE_DEPRECATED_LORA_DOCS__) return;
   window.__MIKAZUKI_HIDE_DEPRECATED_LORA_DOCS__ = true;
 
-  var BLOCKED_PATH_RE = /^\\/lora\\/(basic|flux|sd3|tools|params)(?:\\.(?:html|md))?\\/?$/i;
-  var BLOCKED_LINK_RE = /\\/lora\\/(basic|flux|sd3|tools|params)\\.md$/i;
-  var BLOCKED_LABEL_RE = /^(新手（SD1\\.5）|Flux|SD3\\.5|工具|参数详解)$/i;
+  var BLOCKED_PATH_RE = /^(?:\\/lora\\/(basic|flux|sd3|tools|params)(?:\\.(?:html|md))?\\/?|\\/dreambooth(?:\\/(?:index(?:\\.(?:html|md))?)?)?\\/?)$/i;
+  var BLOCKED_LINK_RE = /(?:\\/lora\\/(basic|flux|sd3|tools|params)\\.md$|\\/dreambooth\\/index\\.md$)/i;
+  var BLOCKED_LABEL_RE = /^(新手（SD1\\.5）|Flux|SD3\\.5|工具|参数详解|Dreambooth\\s*训练)$/i;
   var REDIRECT_TO = "/lora/master.html";
 
   function maybeRedirectBlockedPage() {

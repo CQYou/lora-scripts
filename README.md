@@ -1,6 +1,6 @@
 # SD-Trainer
 
-SD-Trainer（LoRA-scripts）是一个面向 Stable Diffusion 训练的图形化工具集，提供 LoRA / DreamBooth 训练、环境安装、分布式协同与训练诊断能力。
+SD-Trainer（LoRA-scripts）是一个面向 Stable Diffusion 训练的图形化工具集，提供 LoRA 训练、环境安装、分布式协同与训练诊断能力。
 
 本项目基于 `kohya-ss/sd-scripts` 训练生态，重点提供更稳定的工程化训练流程与易用的 GUI 体验。
 

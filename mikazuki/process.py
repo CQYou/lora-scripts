@@ -48,7 +48,6 @@ WORKER_REQUIRED_SYNC_ASSET_KEYS = ("resume",)
 MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
-    "sd-dreambooth": "./scripts/stable/train_db.py",
     "sdxl-finetune": "./scripts/stable/sdxl_train.py",
 }
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"

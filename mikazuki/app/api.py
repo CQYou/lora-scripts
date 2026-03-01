@@ -47,8 +47,6 @@ avaliable_presets = []
 trainer_mapping = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
-
-    "sd-dreambooth": "./scripts/stable/train_db.py",
     "sdxl-finetune": "./scripts/stable/sdxl_train.py",
 }
 
