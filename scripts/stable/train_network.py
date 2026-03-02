@@ -116,7 +116,9 @@ class NetworkTrainer:
                     tensorboard_logs[str(key)] = value
 
             if tensorboard_logs:
-                tensorboard_tracker.log(tensorboard_logs, step=step_value, walltime=self._get_tensorboard_walltime())
+                # Do not force walltime on resumed runs: mixed historical walltime can
+                # make TensorBoard time axis jump backward/forward.
+                tensorboard_tracker.log(tensorboard_logs, step=step_value)
 
         for tracker in other_trackers:
             tracker.log(logs, step=step_value)
