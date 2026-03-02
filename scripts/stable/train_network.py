@@ -126,7 +126,8 @@ class NetworkTrainer:
             logs["max_norm/max_key_norm"] = maximum_norm
 
         lrs = lr_scheduler.get_last_lr()
-        for i, lr in enumerate(lrs):
+        lr_names = []
+        for i, _ in enumerate(lrs):
             if lr_descriptions is not None:
                 lr_desc = lr_descriptions[i]
             else:
@@ -138,14 +139,9 @@ class NetworkTrainer:
                         lr_desc = f"group{idx}"
                     else:
                         lr_desc = "unet"
+            lr_names.append(lr_desc)
 
-            logs[f"lr/{lr_desc}"] = lr
-
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                # tracking d*lr value
-                logs[f"lr/d*lr/{lr_desc}"] = (
-                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                )
+        train_util.append_lr_to_logs_with_names(logs, lr_scheduler, args.optimizer_type, lr_names)
 
         return logs
 

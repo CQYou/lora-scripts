@@ -5756,17 +5756,108 @@ def append_lr_to_logs(logs, lr_scheduler, optimizer_type, including_unet=True):
     append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
 
 
+def _unwrap_optimizer(optimizer):
+    current = optimizer
+    seen = set()
+    while current is not None and hasattr(current, "optimizer"):
+        current_id = id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        next_optimizer = getattr(current, "optimizer", None)
+        if next_optimizer is None or next_optimizer is current:
+            break
+        current = next_optimizer
+    return current
+
+
+def _resolve_optimizer_from_lr_scheduler(lr_scheduler):
+    optimizer = None
+    optimizers = getattr(lr_scheduler, "optimizers", None)
+    if optimizers:
+        optimizer = optimizers[-1]
+    elif hasattr(lr_scheduler, "optimizer"):
+        optimizer = getattr(lr_scheduler, "optimizer", None)
+
+    return _unwrap_optimizer(optimizer) if optimizer is not None else None
+
+
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        pass
+    try:
+        return float(value.item())
+    except Exception:
+        return None
+
+
+def _is_d_adaptive_optimizer_type(optimizer_type):
+    lowered = str(optimizer_type or "").lower()
+    return (
+        lowered.startswith("dadapt")
+        or lowered == "prodigy"
+        or "prodigyplus" in lowered
+        or "schedulefree" in lowered
+    )
+
+
+def _resolve_effective_lr_for_group(optimizer, param_group):
+    if optimizer is None or not isinstance(param_group, dict):
+        return None
+
+    get_dlr = getattr(optimizer, "get_dlr", None)
+    if callable(get_dlr):
+        try:
+            dlr = _safe_float(get_dlr(param_group))
+            if dlr is not None:
+                return dlr
+        except Exception:
+            pass
+
+    d_value = _safe_float(param_group.get("d"))
+    base_lr = _safe_float(param_group.get("lr"))
+    rect = _safe_float(param_group.get("rect"))
+    if d_value is None or base_lr is None:
+        return None
+    if rect is None:
+        rect = 1.0
+    return float(d_value * base_lr * rect)
+
+
 def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
     lrs = lr_scheduler.get_last_lr()
+    optimizer = _resolve_optimizer_from_lr_scheduler(lr_scheduler)
+    param_groups = list(getattr(optimizer, "param_groups", [])) if optimizer is not None else []
+    d_adaptive_type = _is_d_adaptive_optimizer_type(optimizer_type)
 
     for lr_index in range(len(lrs)):
         name = names[lr_index]
-        logs["lr/" + name] = float(lrs[lr_index])
+        logged_lr = _safe_float(lrs[lr_index])
 
-        if optimizer_type.lower().startswith("DAdapt".lower()) or optimizer_type.lower() == "Prodigy".lower():
-            logs["lr/d*lr/" + name] = (
-                lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["lr"]
-            )
+        if lr_index < len(param_groups):
+            group = param_groups[lr_index]
+            # For D-Adaptation / Prodigy / ProdigyPlus, scheduler lr can stay near 1.0.
+            # Prefer the optimizer's effective training lr so TensorBoard reflects real updates.
+            if d_adaptive_type or "d" in group:
+                effective_lr = _resolve_effective_lr_for_group(optimizer, group)
+                if effective_lr is not None:
+                    logged_lr = effective_lr
+
+                d_value = _safe_float(group.get("d"))
+                base_lr = _safe_float(group.get("lr"))
+                rect = _safe_float(group.get("rect"))
+                if d_value is not None and base_lr is not None:
+                    logs["lr/d*lr/" + name] = float(d_value * base_lr)
+                    if rect is not None and abs(rect - 1.0) > 1e-12:
+                        logs["lr/d*lr*rect/" + name] = float(d_value * base_lr * rect)
+
+        if logged_lr is None:
+            logged_lr = 0.0
+        logs["lr/" + name] = float(logged_lr)
 
 
 # scheduler:
