@@ -659,21 +659,14 @@ def _mesh_network_monitor_loop(
             continue
 
         elapsed = max(time.time() - begin_time, 1e-6)
-        in_bytes = max(now_stats["rx_bytes"] - begin_stats["rx_bytes"], 0)
-        out_bytes = max(now_stats["tx_bytes"] - begin_stats["tx_bytes"], 0)
         in_packets = max(now_stats["rx_packets"] - begin_stats["rx_packets"], 0)
         out_packets = max(now_stats["tx_packets"] - begin_stats["tx_packets"], 0)
 
         in_iops = in_packets / elapsed
         out_iops = out_packets / elapsed
-        in_gb = in_bytes / 1_000_000_000
-        out_gb = out_bytes / 1_000_000_000
-        in_gb_s = in_gb / elapsed
-        out_gb_s = out_gb / elapsed
 
         log.info(
-            f"[mesh-net] iface={iface_name} avg_in={in_iops:.1f} iops / {in_gb_s:.4f} GB/s (total {in_gb:.3f} GB), "
-            f"avg_out={out_iops:.1f} iops / {out_gb_s:.4f} GB/s (total {out_gb:.3f} GB)"
+            f"[mesh-net] iface={iface_name} avg_iops(r/w)={in_iops:.1f}/{out_iops:.1f}"
         )
 
     final_stats = _read_network_iface_stats(iface_name)
@@ -682,20 +675,13 @@ def _mesh_network_monitor_loop(
         return
 
     elapsed = max(time.time() - begin_time, 1e-6)
-    in_bytes = max(final_stats["rx_bytes"] - begin_stats["rx_bytes"], 0)
-    out_bytes = max(final_stats["tx_bytes"] - begin_stats["tx_bytes"], 0)
     in_packets = max(final_stats["rx_packets"] - begin_stats["rx_packets"], 0)
     out_packets = max(final_stats["tx_packets"] - begin_stats["tx_packets"], 0)
     in_iops = in_packets / elapsed
     out_iops = out_packets / elapsed
-    in_gb = in_bytes / 1_000_000_000
-    out_gb = out_bytes / 1_000_000_000
-    in_gb_s = in_gb / elapsed
-    out_gb_s = out_gb / elapsed
     log.info(
         f"[mesh-net] monitor stopped: iface={iface_name}, "
-        f"avg_in={in_iops:.1f} iops / {in_gb_s:.4f} GB/s (total {in_gb:.3f} GB), "
-        f"avg_out={out_iops:.1f} iops / {out_gb_s:.4f} GB/s (total {out_gb:.3f} GB)"
+        f"avg_iops(r/w)={in_iops:.1f}/{out_iops:.1f}"
     )
 
 
@@ -1761,12 +1747,6 @@ def run_train(toml_path: str,
     sync_ssh_port = int(get_sync_value("sync_ssh_port", 22) or 22)
     sync_use_password_auth = _to_bool(get_sync_value("sync_use_password_auth", True), True)
     clear_dataset_npz_before_train = _to_bool(distributed_config.get("clear_dataset_npz_before_train"), False)
-    mesh_net_monitor_interval_seconds = _to_int(
-        distributed_config.get("mesh_net_monitor_interval_seconds", MESH_NET_MONITOR_INTERVAL_SECONDS),
-        MESH_NET_MONITOR_INTERVAL_SECONDS,
-    )
-    if mesh_net_monitor_interval_seconds < 1:
-        mesh_net_monitor_interval_seconds = MESH_NET_MONITOR_INTERVAL_SECONDS
     sync_ssh_password = str(
         get_sync_value("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
     ).strip()
@@ -2051,40 +2031,25 @@ def run_train(toml_path: str,
             toml_path,
         ] + launch_cli_overrides
 
-    if not (task := tm.create_task(args, customize_env)):
-        return APIResponse(status="error", message="Failed to create task / 无法创建训练任务")
-
     mesh_iface = ""
     if num_machines > 1:
         mesh_iface = _pick_training_mesh_iface(nccl_socket_ifname, gloo_socket_ifname, str(main_process_ip or ""))
         if mesh_iface:
+            customize_env["MIKAZUKI_MESH_NET_IFACE"] = mesh_iface
             log.info(
-                f"[mesh-net] enabled for distributed training: iface={mesh_iface}, "
-                f"interval={mesh_net_monitor_interval_seconds}s"
+                f"[mesh-net] enabled in trainer postfix: iface={mesh_iface}, "
+                "window=30s, metric=iops, format='r/w:2.1k/2.2k'"
             )
         else:
             log.warning("[mesh-net] distributed training detected but unable to resolve local training interface")
 
+    if not (task := tm.create_task(args, customize_env)):
+        return APIResponse(status="error", message="Failed to create task / 无法创建训练任务")
+
     def _run():
-        mesh_stop_event = None
-        mesh_thread = None
         try:
             run_started_at = time.time()
             task.execute()
-            if num_machines > 1 and mesh_iface:
-                mesh_stop_event = threading.Event()
-                mesh_thread = threading.Thread(
-                    target=_mesh_network_monitor_loop,
-                    args=(
-                        mesh_stop_event,
-                        mesh_iface,
-                        machine_rank,
-                        num_machines,
-                        mesh_net_monitor_interval_seconds,
-                    ),
-                    daemon=True,
-                )
-                mesh_thread.start()
             result = task.communicate()
 
             checkpoint_generated = _has_new_checkpoint_since(runtime_train_config, repo_root, run_started_at) if runtime_train_config else False
@@ -2103,11 +2068,6 @@ def run_train(toml_path: str,
                 log.info(f"Training finished / 训练完成")
         except Exception as e:
             log.error(f"An error occurred when training / 训练出现致命错误: {e}")
-        finally:
-            if mesh_stop_event is not None:
-                mesh_stop_event.set()
-            if mesh_thread is not None and mesh_thread.is_alive():
-                mesh_thread.join(timeout=2)
 
     coro = asyncio.to_thread(_run)
     asyncio.create_task(coro)

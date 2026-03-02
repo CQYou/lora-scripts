@@ -109,6 +109,9 @@ STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 GPU_POWER_QUERY_INTERVAL_SEC = 1.0
 GPU_POWER_SLIDING_WINDOW_SEC = 30.0
+MESH_NET_QUERY_INTERVAL_SEC = 1.0
+MESH_NET_SLIDING_WINDOW_SEC = 30.0
+MESH_NET_IFACE_ENV = "MIKAZUKI_MESH_NET_IFACE"
 
 
 class GPUPowerAverager:
@@ -224,6 +227,126 @@ def append_gpu_power_to_logs(logs: dict, power_averager: Optional[GPUPowerAverag
     power_w = power_averager.get_average_power_w()
     if power_w is not None:
         logs["gpu_power_avg_w"] = round(float(power_w), 1)
+    return logs
+
+
+class MeshNetIOPSAverager:
+    """Best-effort mesh network packet IOPS sampler (packets/sec)."""
+
+    def __init__(
+        self,
+        iface_name: str,
+        sample_interval_sec: float = MESH_NET_QUERY_INTERVAL_SEC,
+        sliding_window_sec: float = MESH_NET_SLIDING_WINDOW_SEC,
+    ):
+        self.iface_name = str(iface_name or "").strip()
+        self.sample_interval_sec = max(0.1, float(sample_interval_sec))
+        self.sliding_window_sec = max(1.0, float(sliding_window_sec))
+        self.packet_samples = deque()  # [(timestamp_sec, rx_packets, tx_packets)]
+        self.cached_iops = None
+        self.available = bool(self.iface_name)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._sampler_thread = None
+
+        if not self.available:
+            return
+
+        snapshot = self._read_iface_packet_snapshot()
+        if snapshot is None:
+            self.available = False
+            return
+
+        now_ts = time.time()
+        self.packet_samples.append((float(now_ts), int(snapshot[0]), int(snapshot[1])))
+        self._sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
+        self._sampler_thread.start()
+
+    @classmethod
+    def from_env(cls):
+        iface_name = str(os.environ.get(MESH_NET_IFACE_ENV, "") or "").strip()
+        if not iface_name:
+            return None
+        averager = cls(iface_name=iface_name)
+        if not averager.available:
+            logger.warning("mesh-net postfix disabled: unable to read stats for iface=%s", iface_name)
+            return None
+        return averager
+
+    def _read_iface_packet_snapshot(self):
+        stat_dir = pathlib.Path("/sys/class/net") / self.iface_name / "statistics"
+        try:
+            rx_packets = int((stat_dir / "rx_packets").read_text(encoding="utf-8").strip())
+            tx_packets = int((stat_dir / "tx_packets").read_text(encoding="utf-8").strip())
+        except Exception:
+            return None
+        return rx_packets, tx_packets
+
+    def _trim_locked(self, now_ts: float):
+        cutoff_ts = now_ts - self.sliding_window_sec
+        while self.packet_samples and self.packet_samples[0][0] < cutoff_ts:
+            self.packet_samples.popleft()
+
+    def _add_sample(self, ts: float, rx_packets: int, tx_packets: int):
+        with self._lock:
+            self.packet_samples.append((float(ts), int(rx_packets), int(tx_packets)))
+            self._trim_locked(float(ts))
+
+    def _sampling_loop(self):
+        # Keep sampling frequency independent from training step duration.
+        while not self._stop_event.is_set() and self.available:
+            start_ts = time.time()
+            snapshot = self._read_iface_packet_snapshot()
+            now_ts = time.time()
+            if snapshot is not None:
+                self._add_sample(now_ts, int(snapshot[0]), int(snapshot[1]))
+            elapsed = max(0.0, now_ts - start_ts)
+            sleep_sec = max(0.0, self.sample_interval_sec - elapsed)
+            if self._stop_event.wait(timeout=sleep_sec):
+                break
+
+    def get_average_iops(self):
+        if not self.available:
+            return None
+
+        now_ts = time.time()
+        with self._lock:
+            self._trim_locked(now_ts)
+            if len(self.packet_samples) < 2:
+                return self.cached_iops
+            start_ts, start_rx, start_tx = self.packet_samples[0]
+            end_ts, end_rx, end_tx = self.packet_samples[-1]
+
+        elapsed = max(float(end_ts) - float(start_ts), 1e-6)
+        in_iops = max(int(end_rx) - int(start_rx), 0) / elapsed
+        out_iops = max(int(end_tx) - int(start_tx), 0) / elapsed
+        self.cached_iops = (float(in_iops), float(out_iops))
+        return self.cached_iops
+
+    def close(self):
+        self._stop_event.set()
+        if self._sampler_thread is not None and self._sampler_thread.is_alive():
+            self._sampler_thread.join(timeout=0.5)
+
+
+def _format_compact_iops(value: float) -> str:
+    value = max(0.0, float(value))
+    units = ["", "k", "m", "g", "t"]
+    unit_idx = 0
+    while value >= 1000.0 and unit_idx < len(units) - 1:
+        value /= 1000.0
+        unit_idx += 1
+    return f"{value:.1f}{units[unit_idx]}"
+
+
+def append_mesh_net_iops_to_logs(logs: dict, mesh_iops_averager: Optional[MeshNetIOPSAverager]):
+    if mesh_iops_averager is None:
+        return logs
+    iops = mesh_iops_averager.get_average_iops()
+    if iops is None:
+        return logs
+    in_iops, out_iops = iops
+    logs["mesh_iops"] = f"r/w:{_format_compact_iops(in_iops)}/{_format_compact_iops(out_iops)}"
     return logs
 
 

@@ -1074,6 +1074,7 @@ class NetworkTrainer:
             desc="steps",
         )
         gpu_power_averager = train_util.GPUPowerAverager() if accelerator.is_local_main_process else None
+        mesh_net_iops_averager = train_util.MeshNetIOPSAverager.from_env() if accelerator.is_local_main_process else None
 
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
@@ -1304,6 +1305,7 @@ class NetworkTrainer:
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 postfix_logs = dict(logs)
                 train_util.append_gpu_power_to_logs(postfix_logs, gpu_power_averager)
+                train_util.append_mesh_net_iops_to_logs(postfix_logs, mesh_net_iops_averager)
                 progress_bar.set_postfix(**postfix_logs)
 
                 if args.scale_weight_norms:
@@ -1348,6 +1350,11 @@ class NetworkTrainer:
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
+
+        if gpu_power_averager is not None:
+            gpu_power_averager.close()
+        if mesh_net_iops_averager is not None:
+            mesh_net_iops_averager.close()
 
         if is_saving_process:
             network = accelerator.unwrap_model(network)

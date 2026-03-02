@@ -605,6 +605,7 @@ def train(args):
 
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     gpu_power_averager = train_util.GPUPowerAverager() if accelerator.is_local_main_process else None
+    mesh_net_iops_averager = train_util.MeshNetIOPSAverager.from_env() if accelerator.is_local_main_process else None
     global_step = 0
 
     noise_scheduler = DDPMScheduler(
@@ -843,6 +844,7 @@ def train(args):
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
             train_util.append_gpu_power_to_logs(logs, gpu_power_averager)
+            train_util.append_mesh_net_iops_to_logs(logs, mesh_net_iops_averager)
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -894,6 +896,11 @@ def train(args):
     text_encoder2 = accelerator.unwrap_model(text_encoder2)
 
     accelerator.end_training()
+
+    if gpu_power_averager is not None:
+        gpu_power_averager.close()
+    if mesh_net_iops_averager is not None:
+        mesh_net_iops_averager.close()
 
     if is_saving_process and (args.save_state or args.save_state_on_train_end):
         train_util.save_state_on_train_end(args, accelerator)
