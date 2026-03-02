@@ -2,6 +2,7 @@ import locale
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -253,7 +254,6 @@ def validate_requirements(requirements_file: str):
             if line.strip() != ''
             and not line.startswith("#")
             and not (line.startswith("-") and not line.startswith("--index-url "))
-            and line is not None
             and "# skip_verify" not in line
         ]
 
@@ -265,9 +265,9 @@ def validate_requirements(requirements_file: str):
 
             if not is_installed(line):
                 if index_url != "":
-                    run_pip(f"install {line} --index-url {index_url}", line, live=True)
+                    run_pip(["install", line, "--index-url", index_url], line, live=True)
                 else:
-                    run_pip(f"install {line}", line, live=True)
+                    run_pip(["install", line], line, live=True)
 
 
 def setup_windows_bitsandbytes():
@@ -283,8 +283,8 @@ def setup_windows_bitsandbytes():
 
     if not installed_bnb or not bnb_cuda_setup:
         log.error("detected wrong install of bitsandbytes, reinstall it")
-        run_pip(f"uninstall bitsandbytes -y", "bitsandbytes", live=True)
-        run_pip(f"install {bnb_package}", bnb_package, live=True)
+        run_pip(["uninstall", "bitsandbytes", "-y"], "bitsandbytes", live=True)
+        run_pip(["install", bnb_package], bnb_package, live=True)
 
 
 def setup_onnxruntime(
@@ -300,8 +300,8 @@ def setup_onnxruntime(
 
     if onnx_version and not is_installed(f"onnxruntime-gpu=={onnx_version}"):
         log.info("uninstalling wrong onnxruntime version")
-        run_pip(f"uninstall onnxruntime -y", "onnxruntime", live=True)
-        run_pip(f"uninstall onnxruntime-gpu -y", "onnxruntime", live=True)
+        run_pip(["uninstall", "onnxruntime", "-y"], "onnxruntime", live=True)
+        run_pip(["uninstall", "onnxruntime-gpu", "-y"], "onnxruntime", live=True)
 
     if not is_installed(f"onnxruntime-gpu"):
         log.info(f"installing onnxruntime")
@@ -310,7 +310,12 @@ def setup_onnxruntime(
 
 
 def run_pip(command, desc=None, live=False):
-    return run(f'"{python_bin}" -m pip {command}', desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
+    if isinstance(command, (list, tuple)):
+        pip_args = [str(x) for x in command]
+    else:
+        pip_args = shlex.split(str(command))
+    pip_cmd = [str(python_bin), "-m", "pip", *pip_args]
+    return run(pip_cmd, desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live, shell=False)
 
 
 def pip_install(package: str, version: Optional[str] = None, index_url: Optional[str] = None, live: bool = True):
@@ -323,11 +328,9 @@ def pip_install(package: str, version: Optional[str] = None, index_url: Optional
     if version:
         package = f"{package}=={version}"
 
-    command = f"install {package}"
-
+    command = ["install", package]
     if index_url:
-        command = f"{command} -i {index_url}"
-
+        command += ["-i", index_url]
     run_pip(command, desc=f"Installing {package}", live=live)
 
 

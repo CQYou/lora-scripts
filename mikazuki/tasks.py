@@ -54,7 +54,7 @@ class Task:
             else:
                 self.process.wait()
             raise
-        except:
+        except Exception:
             self.process.kill()
             raise
         retcode = self.process.poll()

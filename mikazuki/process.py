@@ -10,7 +10,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +51,6 @@ MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
 }
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
-MESH_NET_MONITOR_INTERVAL_SECONDS = 10
 CKPT_EXTENSIONS = {".safetensors", ".ckpt", ".pt"}
 TB_EVENT_FILE_GLOB = "events.out.tfevents.*"
 STATE_REQUIRED_FILES = ("train_state.json", "optimizer.bin", "scheduler.bin")
@@ -275,11 +273,6 @@ def _resolve_per_device_batch_from_global(global_batch: int, world_size: int) ->
         )
 
     return True, gb // ws, ""
-
-
-def _is_network_lora_trainer(trainer_file: str) -> bool:
-    trainer_name = Path(str(trainer_file)).name
-    return trainer_name in {"train_network.py", "sdxl_train_network.py"}
 
 
 def _build_mixed_resolution_plan(
@@ -568,19 +561,6 @@ def _list_local_network_interfaces() -> list[str]:
         return []
 
 
-def _read_network_iface_stats(iface_name: str) -> Optional[dict]:
-    stat_dir = Path("/sys/class/net") / iface_name / "statistics"
-    try:
-        return {
-            "rx_bytes": int((stat_dir / "rx_bytes").read_text(encoding="utf-8").strip()),
-            "tx_bytes": int((stat_dir / "tx_bytes").read_text(encoding="utf-8").strip()),
-            "rx_packets": int((stat_dir / "rx_packets").read_text(encoding="utf-8").strip()),
-            "tx_packets": int((stat_dir / "tx_packets").read_text(encoding="utf-8").strip()),
-        }
-    except Exception:
-        return None
-
-
 def _parse_ifname_candidates(value: str) -> list[str]:
     if not value:
         return []
@@ -631,58 +611,6 @@ def _pick_training_mesh_iface(nccl_socket_ifname: str, gloo_socket_ifname: str, 
             return iface
 
     return ""
-
-
-def _mesh_network_monitor_loop(
-    stop_event: threading.Event,
-    iface_name: str,
-    machine_rank: int,
-    num_machines: int,
-    interval_seconds: int,
-):
-    interval_seconds = max(1, int(interval_seconds))
-    begin_stats = _read_network_iface_stats(iface_name)
-    if begin_stats is None:
-        log.warning(f"[mesh-net] monitor disabled: cannot read interface stats for {iface_name}")
-        return
-
-    begin_time = time.time()
-    log.info(
-        f"[mesh-net] monitor started: iface={iface_name}, rank={machine_rank}/{num_machines - 1}, "
-        f"interval={interval_seconds}s"
-    )
-
-    while not stop_event.wait(interval_seconds):
-        now_stats = _read_network_iface_stats(iface_name)
-        if now_stats is None:
-            log.warning(f"[mesh-net] stat read failed for iface={iface_name}, skip this round")
-            continue
-
-        elapsed = max(time.time() - begin_time, 1e-6)
-        in_packets = max(now_stats["rx_packets"] - begin_stats["rx_packets"], 0)
-        out_packets = max(now_stats["tx_packets"] - begin_stats["tx_packets"], 0)
-
-        in_iops = in_packets / elapsed
-        out_iops = out_packets / elapsed
-
-        log.info(
-            f"[mesh-net] iface={iface_name} avg_iops(r/w)={in_iops:.1f}/{out_iops:.1f}"
-        )
-
-    final_stats = _read_network_iface_stats(iface_name)
-    if final_stats is None:
-        log.info(f"[mesh-net] monitor stopped: iface={iface_name}")
-        return
-
-    elapsed = max(time.time() - begin_time, 1e-6)
-    in_packets = max(final_stats["rx_packets"] - begin_stats["rx_packets"], 0)
-    out_packets = max(final_stats["tx_packets"] - begin_stats["tx_packets"], 0)
-    in_iops = in_packets / elapsed
-    out_iops = out_packets / elapsed
-    log.info(
-        f"[mesh-net] monitor stopped: iface={iface_name}, "
-        f"avg_iops(r/w)={in_iops:.1f}/{out_iops:.1f}"
-    )
 
 
 def _validate_socket_ifname(name: str, env_key: str) -> Tuple[bool, str]:
@@ -1423,27 +1351,6 @@ def _get_latest_remote_toml(
         return None
     path = result.stdout.strip()
     return path or None
-
-
-def _find_first_remote_file(
-    remote_host: str,
-    ssh_port: int,
-    candidates: list,
-    *,
-    use_password_auth: bool = False,
-    ssh_password: str = "",
-) -> Optional[str]:
-    for path in candidates:
-        path_type = _remote_path_type(
-            remote_host,
-            ssh_port,
-            path,
-            use_password_auth=use_password_auth,
-            ssh_password=ssh_password,
-        )
-        if path_type == "file":
-            return path
-    return None
 
 
 def _sync_config_from_main(
