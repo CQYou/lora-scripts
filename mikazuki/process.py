@@ -2036,7 +2036,7 @@ def run_train(toml_path: str,
         mesh_iface = _pick_training_mesh_iface(nccl_socket_ifname, gloo_socket_ifname, str(main_process_ip or ""))
         if mesh_iface:
             customize_env["MIKAZUKI_MESH_NET_IFACE"] = mesh_iface
-            log.info(
+            log.debug(
                 f"[mesh-net] enabled in trainer postfix: iface={mesh_iface}, "
                 "window=30s, metric=iops, format='r/w:2.1k/2.2k'"
             )

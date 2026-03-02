@@ -346,7 +346,24 @@ def append_mesh_net_iops_to_logs(logs: dict, mesh_iops_averager: Optional[MeshNe
     if iops is None:
         return logs
     in_iops, out_iops = iops
-    logs["mesh_iops"] = f"r/w:{_format_compact_iops(in_iops)}/{_format_compact_iops(out_iops)}"
+    iops_text = f"r/w:{_format_compact_iops(in_iops)}/{_format_compact_iops(out_iops)}"
+
+    # Keep mesh-net info inside GPU power field to avoid an extra postfix column.
+    power_value = logs.get("gpu_power_avg_w", None)
+    if power_value is None:
+        logs["gpu_power_avg_w"] = iops_text
+        return logs
+
+    if isinstance(power_value, (int, float)):
+        power_text = f"{float(power_value):.1f}W"
+    else:
+        power_text = str(power_value).strip()
+
+    # Prevent duplicated append if caller updates postfix multiple times.
+    if "r/w:" in power_text:
+        logs["gpu_power_avg_w"] = power_text
+    else:
+        logs["gpu_power_avg_w"] = f"{power_text} {iops_text}".strip()
     return logs
 
 
