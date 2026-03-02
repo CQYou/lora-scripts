@@ -172,7 +172,7 @@ class NetworkTrainer:
         if not getattr(args, "resume", None):
             return
 
-        logging_dir = getattr(args, "logging_dir", None)
+        logging_dir = getattr(args, "resolved_logging_dir", None) or getattr(args, "logging_dir", None)
         if not logging_dir:
             return
 
@@ -183,8 +183,9 @@ class NetworkTrainer:
         self._tensorboard_existing_max_step_by_tag = max_step_by_tag
         existing_max = max(max_step_by_tag.values()) if max_step_by_tag else 0
         logger.info(
-            "tensorboard resume catch-up filter enabled: resume_step=%s, existing_max_step=%s "
+            "tensorboard resume catch-up filter enabled: logging_dir=%s, resume_step=%s, existing_max_step=%s "
             "(logs with step <= existing max for the same tag will be skipped)",
+            str(logging_dir),
             int(resume_start_step),
             int(existing_max),
         )
