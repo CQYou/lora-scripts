@@ -1275,7 +1275,8 @@ class NetworkTrainer:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
                     )
-                    max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
+                    # Keep postfix labels compact so GPU metrics stay visible on narrow terminals.
+                    max_mean_logs = {"keys_scaled": keys_scaled, "avg_key_norm": round(float(mean_norm), 4)}
                 else:
                     keys_scaled, mean_norm, maximum_norm = None, None, None
 
@@ -1309,10 +1310,16 @@ class NetworkTrainer:
                 postfix_logs = dict(logs)
                 train_util.append_gpu_power_to_logs(postfix_logs, gpu_power_averager, compact_for_postfix=True)
                 train_util.append_mesh_net_iops_to_logs(postfix_logs, mesh_net_iops_averager)
-                progress_bar.set_postfix(**postfix_logs)
-
                 if args.scale_weight_norms:
-                    progress_bar.set_postfix(**{**max_mean_logs, **postfix_logs})
+                    # Prioritize GPU info in the visible prefix area for long postfix payloads.
+                    ordered_postfix_logs = {}
+                    if "gpu_power_avg_w" in postfix_logs:
+                        ordered_postfix_logs["gpu_power_avg_w"] = postfix_logs["gpu_power_avg_w"]
+                    ordered_postfix_logs["avr_loss"] = postfix_logs["avr_loss"]
+                    ordered_postfix_logs.update(max_mean_logs)
+                    progress_bar.set_postfix(ordered_postfix_logs)
+                else:
+                    progress_bar.set_postfix(postfix_logs)
 
                 if args.logging_dir is not None:
                     logs = self.generate_step_logs(
