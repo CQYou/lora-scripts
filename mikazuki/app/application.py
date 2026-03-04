@@ -1586,12 +1586,19 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
       var src = String(f.getAttribute("src") || "");
       if (/tensorboard|6006|\\/proxy\\/tensorboard/i.test(src)) return f;
     }
-    return iframes.length === 1 ? iframes[0] : null;
+    // Do not fall back to the only iframe blindly:
+    // during route transitions this can transiently point to tageditor iframe.
+    if (iframes.length !== 1) return null;
+    var sole = iframes[0];
+    var soleSrc = String(sole.getAttribute("src") || "").trim();
+    if (!soleSrc || soleSrc === "about:blank") return sole;
+    return null;
   }
 
   function toTensorboardProxySrc(rawSrc) {
     var src = String(rawSrc || "").trim();
     if (!src) return "/proxy/tensorboard/";
+    if (/^\\/proxy\\/tageditor(?:\\/|$)/i.test(src)) return src;
     if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(src)) {
       return src === "/proxy/tensorboard" ? "/proxy/tensorboard/" : src;
     }
@@ -1599,6 +1606,12 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
     try {
       var u = new URL(src, window.location.href);
       var path = String(u.pathname || "/");
+      if (/^\\/proxy\\/tageditor(?:\\/|$)/i.test(path)) {
+        var tagPass = path;
+        if (u.search) tagPass += u.search;
+        if (u.hash) tagPass += u.hash;
+        return tagPass;
+      }
       if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(path)) {
         var passthrough = path === "/proxy/tensorboard" ? "/proxy/tensorboard/" : path;
         if (u.search) passthrough += u.search;
