@@ -11,7 +11,7 @@ $Env:HF_HOME = "huggingface"
 $Env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
 $Env:PYTHONUTF8 = "1"
 
-$EmbeddedPythonVersion = if ($Env:EMBEDDED_PYTHON_VERSION) { $Env:EMBEDDED_PYTHON_VERSION } else { "3.10" }
+$EmbeddedPythonVersion = if ($Env:EMBEDDED_PYTHON_VERSION) { $Env:EMBEDDED_PYTHON_VERSION } else { "3.11" }
 $EmbeddedPythonDir = if ($Env:EMBEDDED_PYTHON_DIR) { $Env:EMBEDDED_PYTHON_DIR } else { Join-Path $ScriptDir "python" }
 $ToolsDir = if ($Env:EMBEDDED_TOOLS_DIR) { $Env:EMBEDDED_TOOLS_DIR } else { Join-Path $ScriptDir ".tools" }
 $UvExe = Join-Path $ToolsDir "uv.exe"
