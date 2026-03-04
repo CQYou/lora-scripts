@@ -186,7 +186,7 @@ class NetworkTrainer:
         existing_max = max(max_step_by_tag.values()) if max_step_by_tag else 0
         logger.info(
             "tensorboard resume catch-up filter enabled: logging_dir=%s, resume_step=%s, existing_max_step=%s "
-            "(logs with step <= existing max for the same tag will be skipped)",
+            "(logs with step <= existing max for the same tag will be skipped)"，
             str(logging_dir),
             int(resume_start_step),
             int(existing_max),
@@ -232,7 +232,7 @@ class NetworkTrainer:
         return logs
 
     def assert_extra_args(self, args, train_dataset_group):
-        train_dataset_group.verify_bucket_reso_steps(64)
+        train_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
