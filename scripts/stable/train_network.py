@@ -186,7 +186,7 @@ class NetworkTrainer:
         existing_max = max(max_step_by_tag.values()) if max_step_by_tag else 0
         logger.info(
             "tensorboard resume catch-up filter enabled: logging_dir=%s, resume_step=%s, existing_max_step=%s "
-            "(logs with step <= existing max for the same tag will be skipped)"，
+            "(logs with step <= existing max for the same tag will be skipped)",
             str(logging_dir),
             int(resume_start_step),
             int(existing_max),
