@@ -322,18 +322,20 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 #mikazuki-staged-resolution-preview-block {
   margin: 8px 0 12px 0;
   padding: 10px 12px;
-  border: 1px solid #d8e4f3;
+  border: 1px solid var(--c-border-dark, var(--el-border-color, #d8e4f3));
   border-radius: 6px;
-  background: #f6f9ff;
+  background: var(--c-bg-mute, var(--el-fill-color-light, #f6f9ff));
+  color: var(--c-text, var(--c-text-1, #303133));
   font-size: 12px;
   line-height: 1.5;
 }
 #mikazuki-staged-resolution-preview-block .stage-title {
   font-weight: 600;
+  color: var(--c-text-1, var(--c-text, #303133));
   margin-bottom: 6px;
 }
 #mikazuki-staged-resolution-preview-block .stage-note {
-  color: #606266;
+  color: var(--c-text-1, var(--c-text, #303133));
   margin-top: 6px;
 }
 #mikazuki-staged-resolution-preview-block table {
@@ -341,19 +343,24 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
   border-collapse: collapse;
   margin-top: 8px;
 }
+#mikazuki-staged-resolution-preview-block th {
+  background: var(--c-bg-soft, #f3f4f5);
+  color: var(--c-text-1, var(--c-text, #303133));
+}
 #mikazuki-staged-resolution-preview-block th,
 #mikazuki-staged-resolution-preview-block td {
-  border: 1px solid #dfe7f3;
+  border: 1px solid var(--c-border, var(--el-border-color-light, #dfe7f3));
+  color: var(--c-text-1, var(--c-text, #303133));
   padding: 4px 6px;
   text-align: left;
 }
 #mikazuki-staged-resolution-status {
   margin: 8px 0 8px 0;
   padding: 6px 10px;
-  border: 1px dashed #c8d6ea;
+  border: 1px dashed var(--c-border-dark, var(--el-border-color, #c8d6ea));
   border-radius: 6px;
-  background: #f8fbff;
-  color: #606266;
+  background: var(--c-bg-soft, var(--el-fill-color-light, #f8fbff));
+  color: var(--c-text-1, var(--c-text, #303133));
   font-size: 12px;
 }
 </style>
@@ -362,11 +369,26 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
   if (window.__MIKAZUKI_STAGED_RESOLUTION_PREVIEW__) return;
   window.__MIKAZUKI_STAGED_RESOLUTION_PREVIEW__ = true;
 
-  var PHASES = [
-    { side: 512, ratioKey: "staged_resolution_ratio_512", defaultRatioPercent: 40, sampleScale: 4.0 },
-    { side: 768, ratioKey: "staged_resolution_ratio_768", defaultRatioPercent: 30, sampleScale: 1.78 },
-    { side: 1024, ratioKey: "staged_resolution_ratio_1024", defaultRatioPercent: 30, sampleScale: 1.0 }
-  ];
+  var PROFILE_PRESETS = {
+    "1024": {
+      baseSide: 1024,
+      ruleText: "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
+      phases: [
+        { side: 512, ratioKey: "staged_resolution_ratio_512", defaultRatioPercent: 40, sampleScale: 4.0 },
+        { side: 768, ratioKey: "staged_resolution_ratio_768", defaultRatioPercent: 30, sampleScale: 1.78 },
+        { side: 1024, ratioKey: "staged_resolution_ratio_1024", defaultRatioPercent: 30, sampleScale: 1.0 }
+      ]
+    },
+    "2048": {
+      baseSide: 2048,
+      ruleText: "2048=x, 1536=ceil(1.78x), 1024=ceil(4x)",
+      phases: [
+        { side: 1024, ratioKey: "staged_resolution_ratio_2048_base_1024", defaultRatioPercent: 40, sampleScale: 4.0 },
+        { side: 1536, ratioKey: "staged_resolution_ratio_2048_base_1536", defaultRatioPercent: 30, sampleScale: 1.78 },
+        { side: 2048, ratioKey: "staged_resolution_ratio_2048_base_2048", defaultRatioPercent: 30, sampleScale: 1.0 }
+      ]
+    }
+  };
   var state = {
     notifiedResolutionFix: false,
     trainTypeInput: null,
@@ -427,6 +449,31 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var x = Math.max(1, toInt(a, 1));
     var y = Math.max(1, toInt(b, 1));
     return Math.abs(x * y) / gcdInt(x, y);
+  }
+
+  function getProfileByBaseSide(baseSide) {
+    return PROFILE_PRESETS[String(toInt(baseSide, 0))] || null;
+  }
+
+  function getSupportedBaseResolutionText() {
+    return Object.keys(PROFILE_PRESETS)
+      .sort(function (a, b) { return toInt(a, 0) - toInt(b, 0); })
+      .map(function (side) { return side + "," + side; })
+      .join(" 或 ");
+  }
+
+  function getAllRatioKeys() {
+    var map = {};
+    Object.keys(PROFILE_PRESETS).forEach(function (baseKey) {
+      var profile = PROFILE_PRESETS[baseKey] || {};
+      var phases = profile.phases || [];
+      for (var i = 0; i < phases.length; i++) {
+        var key = String((phases[i] || {}).ratioKey || "").trim();
+        if (!key) continue;
+        map[key] = true;
+      }
+    });
+    return Object.keys(map);
   }
 
   function getItemSearchText(item, title) {
@@ -617,9 +664,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return [width, height];
   }
 
-  function isBaseResolution1024(rawValue) {
+  function getSupportedBaseSideFromResolution(rawValue) {
     var pair = parseResolution(rawValue);
-    return !!pair && pair[0] === 1024 && pair[1] === 1024;
+    if (!pair) return null;
+    if (pair[0] !== pair[1]) return null;
+    var side = pair[0];
+    return getProfileByBaseSide(side) ? side : null;
   }
 
   function ensurePreviewBlock(anchorItem) {
@@ -653,18 +703,22 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return block;
   }
 
-  function resolvePhaseRatios() {
+  function resolvePhaseRatios(phases) {
     var ratios = {};
     var total = 0;
     var hasPositive = false;
 
-    for (var i = 0; i < PHASES.length; i++) {
-      var phase = PHASES[i];
+    for (var i = 0; i < phases.length; i++) {
+      var phase = phases[i];
       var ratioField = findSchemaField([
-        new RegExp(phase.ratioKey, "i"),
-        new RegExp(String(phase.side) + ".*占比"),
-        new RegExp("占比.*" + String(phase.side))
+        new RegExp(phase.ratioKey, "i")
       ]);
+      if (!ratioField) {
+        ratioField = findSchemaField([
+          new RegExp(String(phase.side) + ".*占比"),
+          new RegExp("占比.*" + String(phase.side))
+        ]);
+      }
       var value = ratioField ? readFloat(ratioField.item, phase.defaultRatioPercent) : phase.defaultRatioPercent;
       if (!Number.isFinite(value)) {
         return { ok: false, message: phase.ratioKey + " 不是有效数字" };
@@ -687,6 +741,37 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return { ok: true, ratios: ratios, total: total };
   }
 
+  function findFieldByRatioKey(ratioKey) {
+    if (!ratioKey) return null;
+    return findSchemaField([new RegExp(String(ratioKey), "i")]);
+  }
+
+  function setFieldVisible(field, visible) {
+    if (!field || !field.item) return;
+    var next = visible ? "" : "none";
+    if (field.item.style.display !== next) {
+      field.item.style.display = next;
+    }
+  }
+
+  function applyRatioFieldVisibility(activeProfile) {
+    if (!activeProfile) return;
+    var activeMap = {};
+    var phases = activeProfile.phases || [];
+    for (var i = 0; i < phases.length; i++) {
+      var key = String((phases[i] || {}).ratioKey || "").trim();
+      if (key) activeMap[key] = true;
+    }
+
+    var allKeys = getAllRatioKeys();
+    for (var j = 0; j < allKeys.length; j++) {
+      var ratioKey = allKeys[j];
+      var field = findFieldByRatioKey(ratioKey);
+      if (!field) continue;
+      setFieldVisible(field, !!activeMap[ratioKey]);
+    }
+  }
+
   function buildPhasePreview(
     baseBatchGlobal,
     baseGradAccum,
@@ -694,6 +779,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     saveEveryEpochs,
     baseSampleEveryEpochs,
     useSampleEpochSchedule,
+    phases,
+    baseSide,
+    ruleText,
     phaseRatioPercents,
     totalTrainImages,
     worldSize
@@ -731,8 +819,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     }
 
     var baseBatchPerDevice = Math.floor(baseBatchGlobal / safeWorldSize);
-    for (var i = 0; i < PHASES.length; i++) {
-      var phase = PHASES[i];
+    var basePixels = baseSide * baseSide;
+    for (var i = 0; i < phases.length; i++) {
+      var phase = phases[i];
       var side = phase.side;
       var ratioPercent = toFloat((phaseRatioPercents || {})[side], phase.defaultRatioPercent);
       if (!Number.isFinite(ratioPercent)) ratioPercent = phase.defaultRatioPercent;
@@ -740,7 +829,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (ratioPercent > 100) ratioPercent = 100;
 
       var ratio = ratioPercent / 100.0;
-      var phaseBatchGlobal = Math.max(1, Math.floor(baseBatchGlobal * (1024 * 1024) / (side * side)));
+      var phaseBatchGlobal = Math.max(1, Math.floor(baseBatchGlobal * basePixels / (side * side)));
       if (phaseBatchGlobal < safeWorldSize) {
         return {
           ok: false,
@@ -750,7 +839,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
             phaseBatchGlobal +
             ") 小于 world_size(=" +
             safeWorldSize +
-            ")，请调大 1024 基准 batch。"
+            ")，请调大 " +
+            baseSide +
+            " 基准 batch。"
         };
       }
       if (phaseBatchGlobal % safeWorldSize !== 0) {
@@ -762,7 +853,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
             phaseBatchGlobal +
             ") 不能被 world_size(=" +
             safeWorldSize +
-            ") 整除，请调整 1024 基准 batch 或并行规模。"
+            ") 整除，请调整 " +
+            baseSide +
+            " 基准 batch 或并行规模。"
         };
       }
 
@@ -854,6 +947,8 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       totalSteps: canComputeSteps ? totalSteps : null,
       totalTargetSamples: canComputeSteps ? totalTargetSamples : null,
       useSampleEpochSchedule: !!useSampleEpochSchedule,
+      baseSide: baseSide,
+      ruleText: String(ruleText || ""),
       baseGradAccum: baseGradAccum,
       saveEveryEpochs: saveEveryEpochs,
       baseSampleEveryEpochs: baseSampleEveryEpochs,
@@ -899,7 +994,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     }
     html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * ((phase_batch*phase_grad_accum) / (base_batch*base_grad_accum)))</div>';
     html += '<div class="stage-note">Batch 语义: train_batch_size 按“全局 batch”解释；每卡 batch = 全局 batch / world_size（需整除）</div>';
-    html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 1024 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
+    html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 ' + preview.baseSide + ' 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
     if (preview.useSampleEpochSchedule) {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, lcm(phase_save_every_n_epochs, phase_sample_every_n_epochs))</div>';
     } else {
@@ -908,8 +1003,8 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     if (preview.hasOversizedBatchPhase) {
       html += '<div class="stage-note">注意：存在 phase_global_batch > 数据集样本数。DataLoader 会重复采样补满 batch，不会留空位。</div>';
     }
-    html += '<div class="stage-note">CKPT 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
-    html += '<div class="stage-note">Sample 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.baseSampleEveryEpochs + "（仅在 enable_preview + sample_every_n_epochs 生效时用于 epoch 取整）</div>";
+    html += '<div class="stage-note">CKPT 规则: ' + preview.ruleText + '，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
+    html += '<div class="stage-note">Sample 规则: ' + preview.ruleText + '，x=' + preview.baseSampleEveryEpochs + "（仅在 enable_preview + sample_every_n_epochs 生效时用于 epoch 取整）</div>";
     html += '<div class="stage-note">Resume 逻辑: runner 会优先按 staged_plan_id 匹配 state，并以 current_global_samples（缺失则回退 current_step）推断续训阶段；若正好命中阶段边界，将自动设置 resume_epoch_offset=1 进入下一阶段。</div>';
     html += "<table><thead><tr><th>阶段</th><th>Raw 验算</th><th>实际验算</th></tr></thead><tbody>";
     for (var j = 0; j < preview.rows.length; j++) {
@@ -1004,18 +1099,28 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       /训练图片分辨率/,
       /训练分辨率/
     ]);
+    var activeProfile = getProfileByBaseSide(1024);
+    if (!activeProfile) return;
     if (resolutionField) {
       var resolutionText = readText(resolutionField.item);
-      if (!isBaseResolution1024(resolutionText)) {
+      var supportedBaseSide = getSupportedBaseSideFromResolution(resolutionText);
+      if (supportedBaseSide == null) {
         var changed = setText(resolutionField.item, "1024,1024");
         if (changed && !state.notifiedResolutionFix) {
           state.notifiedResolutionFix = true;
           setTimeout(function () {
-            window.alert("已启用阶段分辨率训练：该模式固定以 1024,1024 为基础分辨率，已自动调整当前训练分辨率。");
+            window.alert("已启用阶段分辨率训练：当前仅支持基础分辨率 " + getSupportedBaseResolutionText() + "，已自动调整为 1024,1024。");
           }, 0);
         }
+        activeProfile = getProfileByBaseSide(1024);
+      } else {
+        activeProfile = getProfileByBaseSide(supportedBaseSide) || getProfileByBaseSide(1024);
       }
     }
+    var phases = activeProfile.phases || [];
+    var baseSide = toInt(activeProfile.baseSide, 1024);
+    var ruleText = String(activeProfile.ruleText || "");
+    applyRatioFieldVisibility(activeProfile);
 
     var batchField = findSchemaField([
       /train_batch_size/i,
@@ -1084,7 +1189,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 
     requestTrainImageCount(trainDataDir);
 
-    var ratioState = resolvePhaseRatios();
+    var ratioState = resolvePhaseRatios(phases);
     if (!ratioState.ok) {
       if (statusBlock) {
         updateStatus(statusBlock, "阶段分辨率占比配置错误: " + ratioState.message);
@@ -1108,6 +1213,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       saveEveryEpochs,
       baseSampleEveryEpochs,
       useSampleEpochSchedule,
+      phases,
+      baseSide,
+      ruleText,
       ratioState.ratios,
       state.trainImageCount,
       worldSize
@@ -1123,7 +1231,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (preview.useSampleEpochSchedule) {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；ckpt 与 sample 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x) 并共同参与 epoch 取整。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；ckpt 与 sample 频率按 " + ruleText + " 并共同参与 epoch 取整。"
         );
       } else {
         updateStatus(
@@ -1353,6 +1461,103 @@ _UI_SETTINGS_ABOUT_CLEANUP_INJECTION = f"""
 </script>
 """
 
+_IFRAME_DARK_TRANSITION_GUARD_INJECTION = """
+<style id="mikazuki-iframe-dark-transition-guard-style">
+html.dark .iframe-container.mikazuki-iframe-dark-guard {
+  position: relative;
+  background: var(--c-bg-soft);
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--c-bg-soft);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+  z-index: 5;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard[data-mikazuki-iframe-loading="1"]::before {
+  opacity: 1;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard iframe.iframe-main {
+  transition: opacity 0.16s ease;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard[data-mikazuki-iframe-loading="1"] iframe.iframe-main {
+  opacity: 0.01;
+}
+</style>
+<script id="mikazuki-iframe-dark-transition-guard">
+(function () {
+  if (window.__MIKAZUKI_IFRAME_DARK_TRANSITION_GUARD__) return;
+  window.__MIKAZUKI_IFRAME_DARK_TRANSITION_GUARD__ = true;
+
+  var TARGET_PATH_RE = /(?:^|\\/)(tensorboard|tageditor)(?:\\.(?:html|md))?\\/?$/i;
+
+  function isTargetPage() {
+    var path = (window.location && window.location.pathname) ? String(window.location.pathname) : "";
+    return TARGET_PATH_RE.test(path);
+  }
+
+  function getIframeContainer() {
+    return document.querySelector(".iframe-container");
+  }
+
+  function setLoading(container, loading) {
+    if (!container) return;
+    container.setAttribute("data-mikazuki-iframe-loading", loading ? "1" : "0");
+  }
+
+  function bindContainer(container) {
+    if (!container || container.__mikazukiIframeDarkGuardBound) return;
+    container.__mikazukiIframeDarkGuardBound = true;
+    container.classList.add("mikazuki-iframe-dark-guard");
+    setLoading(container, true);
+
+    var iframe = container.querySelector("iframe.iframe-main") || container.querySelector("iframe");
+    if (!iframe) {
+      setLoading(container, false);
+      return;
+    }
+
+    function clearLoadingSoon(delay) {
+      setTimeout(function () { setLoading(container, false); }, delay);
+    }
+
+    iframe.addEventListener("load", function () {
+      clearLoadingSoon(20);
+    });
+
+    var srcObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "src") {
+          setLoading(container, true);
+          clearLoadingSoon(1800);
+          return;
+        }
+      }
+    });
+    srcObserver.observe(iframe, { attributes: true, attributeFilter: ["src"] });
+
+    clearLoadingSoon(3200);
+    setTimeout(function () { setLoading(container, false); }, 9000);
+  }
+
+  function bootstrap() {
+    if (!isTargetPage()) return;
+    var container = getIframeContainer();
+    if (!container) return;
+    bindContainer(container);
+  }
+
+  var observer = new MutationObserver(function () { bootstrap(); });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("load", bootstrap);
+  setTimeout(bootstrap, 0);
+})();
+</script>
+"""
+
 _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 <script id="mikazuki-tensorboard-runs-default">
 (function () {
@@ -1364,6 +1569,9 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
   var NOISE_LABEL_RE = /(smoothing|ignore outliers|download|tooltip|x-axis|relative|filter|regex|paging|status|sort|direction|ascending|descending|settings|dark mode|light mode|select all|deselect all)/i;
   var DATE_RE = /(20\\d{2})[-_/](\\d{2})[-_/](\\d{2})(?:[ T_:-]?(\\d{2})[:_-]?(\\d{2})[:_-]?(\\d{2}))?/;
   var SUFFIX_RE = /_(\\d{1,6})(?!.*_\\d)/;
+  var TB_THEME_STORAGE_KEY = "_tb_global_settings";
+  var THEME_DARK_RE = /^dark$/i;
+  var THEME_LIGHT_RE = /^light$/i;
 
   function isTensorboardWrapperPath() {
     var path = (window.location && window.location.pathname) ? String(window.location.pathname) : "";
@@ -1378,7 +1586,98 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
       var src = String(f.getAttribute("src") || "");
       if (/tensorboard|6006|\\/proxy\\/tensorboard/i.test(src)) return f;
     }
-    return iframes.length === 1 ? iframes[0] : null;
+    // Do not fall back to the only iframe blindly:
+    // during route transitions this can transiently point to tageditor iframe.
+    if (iframes.length !== 1) return null;
+    var sole = iframes[0];
+    var soleSrc = String(sole.getAttribute("src") || "").trim();
+    if (!soleSrc || soleSrc === "about:blank") return sole;
+    return null;
+  }
+
+  function toTensorboardProxySrc(rawSrc) {
+    var src = String(rawSrc || "").trim();
+    if (!src) return "/proxy/tensorboard/";
+    if (/^\\/proxy\\/tageditor(?:\\/|$)/i.test(src)) return src;
+    if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(src)) {
+      return src === "/proxy/tensorboard" ? "/proxy/tensorboard/" : src;
+    }
+
+    try {
+      var u = new URL(src, window.location.href);
+      var path = String(u.pathname || "/");
+      if (/^\\/proxy\\/tageditor(?:\\/|$)/i.test(path)) {
+        var tagPass = path;
+        if (u.search) tagPass += u.search;
+        if (u.hash) tagPass += u.hash;
+        return tagPass;
+      }
+      if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(path)) {
+        var passthrough = path === "/proxy/tensorboard" ? "/proxy/tensorboard/" : path;
+        if (u.search) passthrough += u.search;
+        if (u.hash) passthrough += u.hash;
+        return passthrough;
+      }
+      var cleanPath = path.replace(/^\\/+/, "");
+      var proxied = "/proxy/tensorboard/" + cleanPath;
+      if (cleanPath === "") proxied = "/proxy/tensorboard/";
+      if (u.search) proxied += u.search;
+      if (u.hash) proxied += u.hash;
+      return proxied;
+    } catch (_e) {
+      return "/proxy/tensorboard/";
+    }
+  }
+
+  function ensureTensorboardIframeProxy(iframe) {
+    if (!iframe) return false;
+    var attrSrc = String(iframe.getAttribute("src") || "").trim();
+    var propSrc = "";
+    try {
+      propSrc = String(iframe.src || "").trim();
+    } catch (_e) {}
+    var current = attrSrc || propSrc;
+    var next = toTensorboardProxySrc(current);
+    if (current === next) return false;
+    iframe.setAttribute("src", next);
+    return true;
+  }
+
+  function forceTensorboardIframeProxyReload(iframe) {
+    if (!iframe) return false;
+    var now = Date.now();
+    var lastTs = Number(iframe.__mikazukiTensorboardProxyReloadTs || 0);
+    if (Number.isFinite(lastTs) && now - lastTs < 1200) return false;
+
+    var attrSrc = String(iframe.getAttribute("src") || "").trim();
+    var propSrc = "";
+    try {
+      propSrc = String(iframe.src || "").trim();
+    } catch (_e) {}
+    var base = toTensorboardProxySrc(attrSrc || propSrc);
+
+    var hash = "";
+    var hashIdx = base.indexOf("#");
+    if (hashIdx >= 0) {
+      hash = base.slice(hashIdx);
+      base = base.slice(0, hashIdx);
+    }
+    var sep = base.indexOf("?") >= 0 ? "&" : "?";
+    var forced = base + sep + "__mikazuki_proxy_reload=" + String(now) + hash;
+    iframe.__mikazukiTensorboardProxyReloadTs = now;
+    iframe.setAttribute("src", forced);
+    return true;
+  }
+
+  function getMainThemeToggleButton() {
+    var buttons = document.querySelectorAll("button.toggle-color-mode-button");
+    if (!buttons || buttons.length === 0) return null;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var title = normalizeLabel(btn.getAttribute("title") || "");
+      if (/toggle color mode/i.test(title)) return btn;
+    }
+    return null;
   }
 
   function parseRunOrderScore(label) {
@@ -1405,6 +1704,192 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 
   function normalizeLabel(text) {
     return String(text || "").replace(/\\s+/g, " ").trim();
+  }
+
+  function isMainPageDarkMode() {
+    var userMode = "";
+    try {
+      userMode = String(window.localStorage.getItem("vuepress-color-scheme") || "").toLowerCase();
+    } catch (_e) {}
+    if (userMode === "dark") return true;
+    if (userMode === "light") return false;
+
+    if (document.documentElement && document.documentElement.classList.contains("dark")) {
+      return true;
+    }
+    return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
+
+  function setTensorboardThemeStorage(win, desiredDark) {
+    if (!win) return;
+    var mode = desiredDark ? "dark" : "light";
+    try {
+      var storage = win.localStorage;
+      if (!storage) return;
+      var raw = String(storage.getItem(TB_THEME_STORAGE_KEY) || "{}");
+      var data = {};
+      try {
+        data = JSON.parse(raw) || {};
+      } catch (_parseErr) {
+        data = {};
+      }
+      if (data.theme === mode) return;
+      data.theme = mode;
+      storage.setItem(TB_THEME_STORAGE_KEY, JSON.stringify(data));
+    } catch (_e) {}
+  }
+
+  function findTensorboardThemeToggleButton(doc) {
+    if (!doc) return null;
+    var selectors = [
+      "button[aria-label]",
+      "button[title]",
+      "app-header-dark-mode-toggle button",
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var nodes = doc.querySelectorAll(selectors[i]);
+      for (var j = 0; j < nodes.length; j++) {
+        var el = nodes[j];
+        var aria = normalizeLabel(el.getAttribute("aria-label") || "");
+        var title = normalizeLabel(el.getAttribute("title") || "");
+        if (
+          /light or dark theme/i.test(aria) ||
+          /current mode/i.test(title) ||
+          /dark mode|light mode|browser default/i.test(title)
+        ) {
+          return el;
+        }
+      }
+    }
+    return null;
+  }
+
+  function getTensorboardCurrentThemeMode(doc, button) {
+    var title = "";
+    if (button) {
+      title = normalizeLabel(button.getAttribute("title") || button.title || "");
+      if (/\\[\\s*dark mode\\s*\\]/i.test(title)) return "dark";
+      if (/\\[\\s*light mode\\s*\\]/i.test(title)) return "light";
+      if (/\\[\\s*browser default\\s*\\]/i.test(title)) return "browser_default";
+    }
+
+    if (doc && doc.body && doc.body.classList.contains("dark-mode")) {
+      return "dark";
+    }
+    return "light";
+  }
+
+  function clickTensorboardThemeMenuItem(doc, desiredDark) {
+    if (!doc) return false;
+    var targetRe = desiredDark ? THEME_DARK_RE : THEME_LIGHT_RE;
+    var buttons = doc.querySelectorAll(
+      "button[mat-menu-item], .mat-mdc-menu-panel button, .cdk-overlay-container button, button[role='menuitem']"
+    );
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i];
+      var label = normalizeLabel(b.textContent || b.innerText || "");
+      if (!targetRe.test(label)) continue;
+      if (typeof b.click === "function") {
+        b.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function syncTensorboardTheme(iframe) {
+    var win = null;
+    var doc = null;
+    try {
+      win = iframe.contentWindow || null;
+      doc = iframe.contentDocument || (win ? win.document : null);
+    } catch (_e) {
+      if (!ensureTensorboardIframeProxy(iframe)) {
+        forceTensorboardIframeProxyReload(iframe);
+      }
+      return false;
+    }
+    if (!doc || !doc.documentElement) return false;
+
+    var desiredDark = isMainPageDarkMode();
+    var desiredMode = desiredDark ? "dark" : "light";
+    setTensorboardThemeStorage(win, desiredDark);
+
+    if (doc.body) {
+      doc.body.classList.toggle("dark-mode", desiredDark);
+    }
+
+    var button = findTensorboardThemeToggleButton(doc);
+    var currentMode = getTensorboardCurrentThemeMode(doc, button);
+    if (currentMode === desiredMode) return true;
+
+    if (!button || !win) return false;
+    if (win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__) return false;
+
+    win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__ = true;
+    try {
+      if (typeof button.click === "function") button.click();
+    } catch (_e) {}
+
+    setTimeout(function () {
+      var clicked = clickTensorboardThemeMenuItem(doc, desiredDark);
+      if (!clicked) {
+        try {
+          if (typeof button.click === "function") button.click();
+        } catch (_e) {}
+        setTimeout(function () {
+          clickTensorboardThemeMenuItem(doc, desiredDark);
+        }, 120);
+      }
+      setTimeout(function () {
+        win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__ = false;
+      }, 220);
+    }, 70);
+
+    return false;
+  }
+
+  function triggerTensorboardThemeSync() {
+    if (!isTensorboardWrapperPath()) return;
+    var iframe = getTensorboardIframe();
+    if (!iframe) return;
+    var proxied = ensureTensorboardIframeProxy(iframe);
+    bindTensorboardIframe(iframe);
+    if (proxied) {
+      setTimeout(function () { syncTensorboardTheme(iframe); }, 260);
+      setTimeout(function () { syncTensorboardTheme(iframe); }, 900);
+      return;
+    }
+    syncTensorboardTheme(iframe);
+    setTimeout(function () { syncTensorboardTheme(iframe); }, 160);
+    setTimeout(function () { syncTensorboardTheme(iframe); }, 460);
+  }
+
+  function bindMainThemeTrigger() {
+    var btn = getMainThemeToggleButton();
+    if (!btn || btn.__mikazukiTensorboardThemeTriggerBound) return;
+    btn.__mikazukiTensorboardThemeTriggerBound = true;
+    btn.addEventListener("click", function () {
+      // Theme class/localStorage updates happen asynchronously in VuePress.
+      setTimeout(triggerTensorboardThemeSync, 0);
+      setTimeout(triggerTensorboardThemeSync, 140);
+      setTimeout(triggerTensorboardThemeSync, 420);
+    }, true);
+  }
+
+  function bindRootThemeClassTrigger() {
+    var root = document.documentElement;
+    if (!root || root.__mikazukiTensorboardThemeClassObserverBound) return;
+    root.__mikazukiTensorboardThemeClassObserverBound = true;
+    var obs = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "class") {
+          triggerTensorboardThemeSync();
+          return;
+        }
+      }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ["class"] });
   }
 
   function getRunCandidates(doc) {
@@ -1540,40 +2025,68 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 
     var tries = 0;
     var maxTries = 180;
-    var timer = null;
+    var runTimer = null;
 
-    function tryApply() {
+    function tryApplyRuns() {
       tries += 1;
       var done = applyToIframeDocument(iframe);
       if (done || tries >= maxTries) {
-        if (timer) {
-          clearInterval(timer);
-          timer = null;
+        if (runTimer) {
+          clearInterval(runTimer);
+          runTimer = null;
         }
       }
     }
 
+    function trySyncThemeNow() {
+      syncTensorboardTheme(iframe);
+    }
+
+    var srcObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "src") {
+          var changed = ensureTensorboardIframeProxy(iframe);
+          if (changed) {
+            setTimeout(trySyncThemeNow, 260);
+            return;
+          }
+          setTimeout(trySyncThemeNow, 120);
+          return;
+        }
+      }
+    });
+    srcObserver.observe(iframe, { attributes: true, attributeFilter: ["src"] });
+
     iframe.addEventListener("load", function () {
+      ensureTensorboardIframeProxy(iframe);
       tries = 0;
-      setTimeout(tryApply, 250);
-      setTimeout(tryApply, 1200);
+      setTimeout(tryApplyRuns, 250);
+      setTimeout(tryApplyRuns, 1200);
+      setTimeout(trySyncThemeNow, 320);
+      setTimeout(trySyncThemeNow, 1100);
     });
 
-    timer = setInterval(tryApply, 800);
-    setTimeout(tryApply, 300);
+    runTimer = setInterval(tryApplyRuns, 800);
+    setTimeout(tryApplyRuns, 300);
+    setTimeout(trySyncThemeNow, 380);
   }
 
   function bootstrap() {
     if (!isTensorboardWrapperPath()) return;
+    bindMainThemeTrigger();
+    bindRootThemeClassTrigger();
     var iframe = getTensorboardIframe();
-    if (iframe) bindTensorboardIframe(iframe);
+    if (iframe) {
+      ensureTensorboardIframeProxy(iframe);
+      bindTensorboardIframe(iframe);
+      syncTensorboardTheme(iframe);
+    }
   }
 
   var observer = new MutationObserver(function () { bootstrap(); });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("load", bootstrap);
   setTimeout(bootstrap, 0);
-  setInterval(bootstrap, 1500);
 })();
 </script>
 """
@@ -1710,6 +2223,20 @@ def _inject_ui_settings_about_cleanup(html_content: str) -> str:
     return _UI_SETTINGS_ABOUT_CLEANUP_INJECTION + "\n" + html_content
 
 
+def _inject_iframe_dark_transition_guard(html_content: str) -> str:
+    if 'id="mikazuki-iframe-dark-transition-guard"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n</head>", 1)
+
+    return _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n" + html_content
+
+
 def _inject_tensorboard_runs_default(html_content: str) -> str:
     if 'id="mikazuki-tensorboard-runs-default"' in html_content:
         return html_content
@@ -1787,6 +2314,7 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
     content = _inject_schema_bootstrap(content)
     content = _inject_hide_deprecated_lora_docs(content)
     content = _inject_ui_settings_about_cleanup(content)
+    content = _inject_iframe_dark_transition_guard(content)
     content = _inject_tensorboard_runs_default(content)
     content = _inject_ctrl_s_save_config(content)
     content = _inject_worker_mode_guard(content)

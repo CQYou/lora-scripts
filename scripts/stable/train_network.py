@@ -1313,8 +1313,9 @@ class NetworkTrainer:
                 if args.scale_weight_norms:
                     # Prioritize GPU info in the visible prefix area for long postfix payloads.
                     ordered_postfix_logs = {}
-                    if "gpu_power_avg_w" in postfix_logs:
-                        ordered_postfix_logs["gpu_power_avg_w"] = postfix_logs["gpu_power_avg_w"]
+                    gpu_key = "gpu_pwr" if "gpu_pwr" in postfix_logs else "gpu_power_avg_w"
+                    if gpu_key in postfix_logs:
+                        ordered_postfix_logs[gpu_key] = postfix_logs[gpu_key]
                     ordered_postfix_logs["avr_loss"] = postfix_logs["avr_loss"]
                     ordered_postfix_logs.update(max_mean_logs)
                     progress_bar.set_postfix(ordered_postfix_logs)

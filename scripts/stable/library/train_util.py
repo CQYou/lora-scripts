@@ -124,6 +124,7 @@ class GPUPowerAverager:
         self.snapshot_samples = deque()  # [(timestamp_sec, power_w, vram_used_mb)]
         self.cached_power_w = None
         self.cached_vram_used_mb = None
+        self._last_sync_query_ts = 0.0
         self.device_ids = self._parse_visible_device_ids()
         self.available = True
         self._lock = threading.Lock()
@@ -167,11 +168,9 @@ class GPUPowerAverager:
                 check=False,
             )
         except Exception:
-            self.available = False
             return None
 
         if proc.returncode != 0:
-            self.available = False
             return None
 
         power_values = []
@@ -228,6 +227,17 @@ class GPUPowerAverager:
             return None, None
 
         now = time.time()
+        # Query once per sample interval from the caller thread so displayed/TB values
+        # do not get stuck when the background sampler stalls or returns stale data.
+        if (now - float(self._last_sync_query_ts)) >= self.sample_interval_sec:
+            snapshot = self._query_snapshot_metrics()
+            self._last_sync_query_ts = float(now)
+            if snapshot is not None:
+                self._add_sample(now, snapshot[0], snapshot[1])
+                self.cached_power_w = float(snapshot[0]) if snapshot[0] is not None else self.cached_power_w
+                self.cached_vram_used_mb = float(snapshot[1]) if snapshot[1] is not None else self.cached_vram_used_mb
+                return self.cached_power_w, self.cached_vram_used_mb
+
         with self._lock:
             self._trim_locked(now)
             if not self.snapshot_samples:
@@ -267,17 +277,25 @@ def append_gpu_power_to_logs(logs: dict, power_averager: Optional[GPUPowerAverag
     if compact_for_postfix:
         power_value = logs.get("gpu_power_avg_w")
         vram_value = logs.get("gpu_vram_used_mb")
+        power_text = None
+        vram_text = None
+        if power_value is not None:
+            if isinstance(power_value, (int, float)):
+                power_text = f"{int(float(power_value))}W"
+            else:
+                power_text = str(power_value).strip()
         if vram_value is not None:
             vram_text = f"{int(vram_value):,}MB"
-            if power_value is not None:
-                if isinstance(power_value, (int, float)):
-                    power_text = f"{float(power_value):.1f}W"
-                else:
-                    power_text = str(power_value).strip()
-                logs["gpu_power_avg_w"] = f"{power_text} {vram_text}".strip()
-            else:
-                logs["gpu_power_avg_w"] = vram_text
-            logs.pop("gpu_vram_used_mb", None)
+
+        if power_text is not None and vram_text is not None:
+            logs["gpu_pwr"] = f"{power_text} gpu_vram={vram_text}".strip()
+        elif power_text is not None:
+            logs["gpu_pwr"] = power_text
+        elif vram_text is not None:
+            logs["gpu_pwr"] = f"gpu_vram={vram_text}".strip()
+
+        logs.pop("gpu_power_avg_w", None)
+        logs.pop("gpu_vram_used_mb", None)
 
     return logs
 
@@ -412,9 +430,10 @@ def append_mesh_net_iops_to_logs(logs: dict, mesh_iops_averager: Optional[MeshNe
     iops_text = f"r/w:{_format_compact_iops(in_iops)}/{_format_compact_iops(out_iops)}"
 
     # Keep mesh-net info inside GPU power field to avoid an extra postfix column.
-    power_value = logs.get("gpu_power_avg_w", None)
+    power_key = "gpu_pwr" if "gpu_pwr" in logs else "gpu_power_avg_w"
+    power_value = logs.get(power_key, None)
     if power_value is None:
-        logs["gpu_power_avg_w"] = iops_text
+        logs[power_key] = iops_text
         return logs
 
     if isinstance(power_value, (int, float)):
@@ -424,9 +443,9 @@ def append_mesh_net_iops_to_logs(logs: dict, mesh_iops_averager: Optional[MeshNe
 
     # Prevent duplicated append if caller updates postfix multiple times.
     if "r/w:" in power_text:
-        logs["gpu_power_avg_w"] = power_text
+        logs[power_key] = power_text
     else:
-        logs["gpu_power_avg_w"] = f"{power_text} {iops_text}".strip()
+        logs[power_key] = f"{power_text} {iops_text}".strip()
     return logs
 
 
